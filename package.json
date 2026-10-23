@@ -1,7 +1,7 @@
 {
   "name": "kavan-bot",
-  "version": "2.0.0",
-  "description": "Kavan — smart 24/7 Telegram group bot with LLM persona",
+  "version": "3.0.0",
+  "description": "Kavan v3 — dual-token, human-like Telegram group member",
   "type": "module",
   "main": "server.js",
   "scripts": {
