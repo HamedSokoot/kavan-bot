@@ -192,6 +192,21 @@ function pickReaction(text) {
   return REACT_POOL[Math.floor(Math.random() * REACT_POOL.length)];
 }
 
+// --- membership awareness (lets the solo account act when the twin isn't in the group yet) ---
+const membershipCache = new Map(); // "chatId:botId" -> {inGroup, at}
+async function twinInGroup(chatId, bot) {
+  const twin = BOTS.find(b => b.idx !== bot.idx);
+  if (!twin) return false;
+  const key = `${chatId}:${twin.id}`;
+  const now = Date.now();
+  const c = membershipCache.get(key);
+  if (c && now - c.at < 60000) return c.inGroup;
+  const r = await call(bot.token, 'getChatMember', { chat_id: chatId, user_id: twin.id });
+  const inGroup = !!r?.ok && ['member', 'administrator', 'creator', 'restricted'].includes(r.result?.status);
+  membershipCache.set(key, { inGroup, at: now });
+  return inGroup;
+}
+
 // --- group logic ------------------------------------------------------------
 async function handleGroup(msg, bot) {
   const chatId = msg.chat.id;
@@ -260,8 +275,9 @@ async function handleGroup(msg, bot) {
   if (mentionsThis || replyOwnerIdx === bot.idx) actor = bot.idx;                 // pointed at me
   else if (mentionsOther || (replyOwnerIdx !== undefined && replyOwnerIdx !== bot.idx)) actor = -1; // pointed at twin
   else if (namedKavan || true) {                                                  // generic / named
+    const twinOk = BOTS.length > 1 ? await twinInGroup(chatId, bot) : false;
     const h = hashN(chatId, msg.message_id);
-    const want = (h % 100 < 70) ? PRIMARY : (BOTS.length > 1 ? 1 - PRIMARY : PRIMARY);
+    const want = !twinOk ? bot.idx : ((h % 100 < 70) ? PRIMARY : (1 - PRIMARY));
     if (bot.idx === want) actor = bot.idx;
   }
   if (actor !== bot.idx) return;
