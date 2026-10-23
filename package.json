@@ -1,0 +1,17 @@
+{
+  "name": "kavan-bot",
+  "version": "2.0.0",
+  "description": "Kavan — smart 24/7 Telegram group bot with LLM persona",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "z-ai-web-dev-sdk": "0.0.18"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
