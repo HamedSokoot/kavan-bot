@@ -5,7 +5,8 @@
  *   BOT_TOKEN    primary token (the actor Kavan)          [required]
  *   BOT2_TOKEN   secondary token (backup account)         [optional]
  *   OWNER_ID     owner user id (default 6252224878)
- *   ZAI_CONFIG_JSON  enables the LLM brain
+ *   BRAIN_URL    LLM endpoint (default https://text.pollinations.ai/openai, no key)
+ *   OPENROUTER_API_KEY  optional stronger brain (used first when present)
  *   CHATTER_PROBABILITY  0..1 spontaneous reply chance (default 0.35)
  *   COOLDOWN_SECONDS     min secs between spontaneous replies (default 45)
  *   OBSERVE_MSGS         msgs to silently watch after boot (default 12)
@@ -21,8 +22,6 @@ import express from 'express';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import ZAI from 'z-ai-web-dev-sdk';
-
 const OWNER_ID = Number(process.env.OWNER_ID || 6252224878);
 const OWNER_SIG = 'HAMED'; // anonymous-admin signature of the owner
 const DRY = process.env.KAVAN_DRYRUN === '1';
@@ -54,14 +53,77 @@ if (!BOTS.length) { console.error('FATAL: no valid bot token'); process.exit(1);
 const botById = id => BOTS.find(b => b.id === id);
 const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 
-// --- LLM --------------------------------------------------------------------
-if (process.env.ZAI_CONFIG_JSON) {
-  try { fs.writeFileSync(path.join(os.homedir(), '.z-ai-config'), process.env.ZAI_CONFIG_JSON); }
-  catch (e) { console.error('config write failed:', e.message); }
+// --- LLM brain (v3.5) -------------------------------------------------------
+// The z-ai-web-dev-sdk endpoint (internal-api.z.ai) is only reachable from the
+// sandbox; on Render every call died with UND_ERR_CONNECT_TIMEOUT. Use a free
+// no-key endpoint instead, serialize calls, and keep a template fallback.
+const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
+const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai,openai-fast,mistral').split(',').map(s => s.trim()).filter(Boolean);
+const OR_KEY = process.env.OPENROUTER_API_KEY || '';
+let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0;
+let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
+
+async function brainChat(messages) {
+  if (Date.now() < llmDisabledUntil) throw new Error('brain cooling down');
+  const run = async () => {
+    const gap = Date.now() - llmLastCall;
+    if (gap < 3200) await new Promise(r => setTimeout(r, 3200 - gap));
+    llmLastCall = Date.now();
+    let lastErr;
+    const targets = [];
+    if (OR_KEY) targets.push({ url: 'https://openrouter.ai/api/v1/chat/completions', model: 'google/gemini-2.0-flash-001', hdr: { Authorization: `Bearer ${OR_KEY}` } });
+    for (const model of BRAIN_MODELS) targets.push({ url: BRAIN_URL, model, hdr: {} });
+    for (const t of targets) {
+      // two passes per target: first try, then one slow retry on rate-limit
+      for (let pass = 0; pass < 2; pass++) {
+        if (pass === 1 && t !== targets[0]) break; // slow rate-limit retry only for primary target
+        try {
+          if (pass === 1) await new Promise(r => setTimeout(r, 31000)); // anonymous quota window
+          const r = await fetch(t.url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...t.hdr },
+            body: JSON.stringify({ model: t.model, messages, max_tokens: 120, temperature: 0.95, referrer: 'kavan-bot', private: true }),
+            signal: AbortSignal.timeout(20000),
+          });
+          if (!r.ok) throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''}`);
+          const c = await r.json();
+          const txt = (c?.choices?.[0]?.message?.content || '').trim();
+          if (!txt) throw new Error('empty content');
+          llmFails = 0; llmLastOk = Date.now(); llmLastErr = '';
+          return txt;
+        } catch (e) {
+          lastErr = e;
+          const rl = /\+rl/.test(e.message || '');
+          console.error(`brain miss [${t.model}] pass${pass}:`, e.message);
+          if (!rl) break; // non-rate-limit errors: move to next model immediately
+        }
+      }
+    }
+    llmFails++; llmLastErr = lastErr?.message || 'unknown';
+    if (llmFails >= 3) { llmDisabledUntil = Date.now() + 3 * 60 * 1000; llmFails = 0; console.error('brain disabled for 3min after repeated failures'); }
+    throw lastErr || new Error('all brain targets failed');
+  };
+  const p = llmChain.then(run, run);
+  llmChain = p.catch(() => {});
+  return p;
 }
-let zai = null;
-try { zai = await ZAI.create(); console.log('LLM brain: ONLINE'); }
-catch (e) { console.error('LLM brain offline:', e.message); }
+
+// offline fallback: light pattern replies, always in character
+const TPL = {
+  greet: ['سلام داداش 🔥', 'سلاممم 👋 چه خبر؟', 'سلام جووون 👀', 'درود مشتی 😎'],
+  how: ['خوبیم داداش، تو چطوری؟ 😎', 'قربونت، تو چیکاری؟ 👀', 'مرسی داداش تو خوبی؟'],
+  laugh: ['خخخخخ 😂', 'وای خدای من 😂😂', 'نکش داداش خخ 😭', 'جون مادرت خفن کردی 😂'],
+  q: ['والا خودمم موندم 😂', 'راستش نمیدونم داداش 😅', 'شاید بابا 👀', 'معلومه دیگه 😎'],
+};
+function templateSay(text) {
+  const t = text || '';
+  const pick = a => a[Math.floor(Math.random() * a.length)];
+  if (/^سلام|درود|هلو|هلو|hi\b|hello/i.test(t)) return pick(TPL.greet);
+  if (/چطوری|خوبی|چه خبر|کجایی|چیکار می|حالت/i.test(t)) return pick(TPL.how);
+  if (/😂|🤣|خخ|ههه|لول|لطیف|جک/.test(t)) return pick(TPL.laugh);
+  if (/[?؟]/.test(t)) return pick(TPL.q);
+  return null;
+}
 
 const PERSONA = `تو «کاوان» هستی — یه پسر جوون ایرانی و عضو گروه بتل رپ «Taj Parsian Gp».
 شخصیت: بااعتمادبه‌نفس، شیطون، زبون‌باز، وفادار به رئیس (HAMED، سازنده‌ی گروه — بهش می‌گی رئیس)، اهل کل‌کل بازیگوش، بعضی وقتا قافیه و بیت می‌ریزی.
@@ -133,36 +195,41 @@ function mentionsBot(text) {
 const MENTION_FALLBACKS = ['جانم؟ 👀', 'گو داداش', 'بله؟ 😎', 'چه خبر؟', 'بعله؟'];
 const ACCUSE_FALLBACKS = ['حالا خودتم 😂', 'تو دیدنی داداش', 'چی رو گفتی 😂', 'برو بابا 😎'];
 
-async function kavanSay(contextText, chatId, force = false, fallbacks = MENTION_FALLBACKS) {
-  // returns reply text or null ([سکوت] / failure / bot-talk after retry)
-  if (!zai) return force ? fallbacks[Math.floor(Math.random() * fallbacks.length)] : null;
+async function kavanSay(contextText, chatId, force = false, fallbacks = MENTION_FALLBACKS, rawText = '') {
+  // returns reply text or null ([سکوت] / failure / bot-talk after retry). NEVER throws.
+  const pickFb = () => fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  const fb = () => (force ? pickFb() : null);
   const ctx = force
     ? contextText + '\n\n(این پیام مستقیم به توئه — حتماً یه جواب کوتاه طبیعی بده؛ [سکوت] اینجا مجاز نیست.)'
     : contextText;
   const attempt = async (extra) => {
     const msgs = [{ role: 'system', content: PERSONA }];
-    if (extra) msgs.push({ role: 'user', content: extra }, { role: 'user', content: 'حالا جواب اصلی رو بده.' });
+    if (extra) msgs.push({ role: 'user', content: extra });
     msgs.push({ role: 'user', content: ctx });
-    const c = await zai.chat.completions.create({ messages: msgs, thinking: { type: 'disabled' } });
-    return c?.choices?.[0]?.message?.content?.trim() || null;
+    return (await brainChat(msgs)) || null;
   };
-  let reply = await attempt(null);
-  if (!reply) return force ? fallbacks[Math.floor(Math.random() * fallbacks.length)] : null;
-  if (mentionsBot(reply)) {
-    reply = await attempt('هشدار: جواب قبلیت اشاره به ربات/هوش مصنوعی داشت — کاملاً ممنوع. مثل یه آدم معمولی و بدون هیچ اشاره‌ای به این موضوع دوباره جواب بده.');
-    if (!reply || mentionsBot(reply)) return force ? fallbacks[Math.floor(Math.random() * fallbacks.length)] : null;
+  try {
+    let reply = await attempt(null);
+    if (!reply) return fb();
+    if (mentionsBot(reply)) {
+      reply = await attempt('هشدار: جواب قبلیت اشاره به ربات/هوش مصنوعی داشت — کاملاً ممنوع. مثل یه آدم معمولی و بدون هیچ اشاره‌ای به این موضوع دوباره جواب بده.');
+      if (!reply || mentionsBot(reply)) return fb();
+    }
+    if (reply.includes('[سکوت]')) {
+      if (!force) return templateSay(rawText);
+      reply = pickFb();
+    }
+    if (reply && reply.length > 220) reply = reply.slice(0, 210).trim() + '...';
+    if (reply && chatId && stateOf(chatId).ownReplies.includes(reply.slice(0, 80))) {
+      reply = await attempt('جواب قبلیت عیناً تکراری بود. یه جواب متفاوت بده.');
+      if (!reply || reply.includes('[سکوت]') || mentionsBot(reply)) return fb();
+    }
+    if (reply && !/[\p{L}]/u.test(reply)) return null; // emoji-only "reply" → stay silent instead
+    return reply;
+  } catch (e) {
+    console.error('kavanSay fallback:', e.message);
+    return force ? pickFb() : templateSay(rawText);
   }
-  if (reply.includes('[سکوت]')) {
-    if (!force) return null;
-    reply = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-  }
-  if (reply && reply.length > 220) reply = reply.slice(0, 210).trim() + '...';
-  if (reply && chatId && stateOf(chatId).ownReplies.includes(reply.slice(0, 80))) {
-    reply = await attempt('جواب قبلیت عیناً تکراری بود. یه جواب متفاوت بده.');
-    if (!reply || reply.includes('[سکوت]') || mentionsBot(reply)) return force ? fallbacks[Math.floor(Math.random() * fallbacks.length)] : null;
-  }
-  if (reply && !/[\p{L}]/u.test(reply)) return null; // emoji-only "reply" → stay silent instead
-  return reply;
 }
 
 function contextFrom(chatId, incoming) {
@@ -356,7 +423,7 @@ async function handleGroup(msg, bot) {
   setTimeout(async () => {
     try {
       const force = mentionsThis || namedKavan || replyOwnerIdx !== undefined || accused;
-      let replyText = await kavanSay(contextFrom(chatId, incoming), chatId, force, accused ? ACCUSE_FALLBACKS : MENTION_FALLBACKS);
+      let replyText = await kavanSay(contextFrom(chatId, incoming), chatId, force, accused ? ACCUSE_FALLBACKS : MENTION_FALLBACKS, incoming.text);
       if (!replyText) return; // silence is human too
       const extra = {};
       if (force) {
@@ -438,9 +505,26 @@ app.get('/debug', (req, res) => {
 
 app.get('/health', (_req, res) => res.json({
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
-  brain: zai ? 'online' : 'template',
+  brain: Date.now() < llmDisabledUntil ? 'fallback-templates' : (llmLastOk ? 'online' : 'warming-up'),
+  brainModels: (OR_KEY ? ['openrouter'] : []).concat(BRAIN_MODELS),
+  lastBrainError: llmLastErr || null,
+  lastBrainOk: llmLastOk ? new Date(llmLastOk).toISOString() : null,
   dryrun: DRY,
 }));
+
+// connectivity probe: does the LLM endpoint work from THIS host right now?
+app.get('/nettest', async (_req, res) => {
+  const t0 = Date.now();
+  try {
+    const r = await fetch(BRAIN_URL, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'openai-fast', messages: [{ role: 'user', content: 'salam' }], max_tokens: 10 }),
+      signal: AbortSignal.timeout(15000),
+    });
+    const body = await r.text();
+    res.json({ ok: r.ok, status: r.status, ms: Date.now() - t0, sample: body.slice(0, 160) });
+  } catch (e) { res.json({ ok: false, error: e.message, ms: Date.now() - t0 }); }
+});
 
 const routeFor = idx => (req, res) => {
   res.sendStatus(200); // ack instantly, work async
