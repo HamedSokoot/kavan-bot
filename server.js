@@ -28,7 +28,7 @@ const OWNER_SIG = 'HAMED'; // anonymous-admin signature of the owner
 const DRY = process.env.KAVAN_DRYRUN === '1';
 const CHATTER_PROB = Number(process.env.CHATTER_PROBABILITY ?? '0.35');
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS ?? '45') * 1000;
-const OBSERVE_MSGS = Number(process.env.OBSERVE_MSGS ?? '12');
+const OBSERVE_MSGS = Number(process.env.OBSERVE_MSGS ?? '6');
 const ARCHIVE = path.join(process.cwd(), 'kavan_archive.jsonl');
 
 // --- telegram ---------------------------------------------------------------
@@ -72,12 +72,12 @@ const PERSONA = `تو «کاوان» هستی — یه پسر جوون ایرا�
 const REACT_POOL = ['🔥', '👏', '💯', '🤣', '⚡', '🏆', '❤', '🫡', '🤔'];
 
 // --- state ------------------------------------------------------------------
-const chatState = new Map();  // chatId -> {history, msgsSeen, lastBotMsg, lastSpont, msgsSinceBot, ownReplies[]}
+const chatState = new Map();  // chatId -> {history, msgsSeen, firstSeen, lastBotMsg, lastSpont, msgsSinceBot, ownReplies[]}
 const userStyle = new Map();  // chatId -> Map(uid -> {name, texts[], avgLen, emoji})
 const ownMessages = new Map(); // message_id -> bot idx (both accounts' sent msgs)
 
 function stateOf(chatId) {
-  if (!chatState.has(chatId)) chatState.set(chatId, { history: [], msgsSeen: 0, lastBotMsg: 0, lastSpont: 0, msgsSinceBot: 99, ownReplies: [] });
+  if (!chatState.has(chatId)) chatState.set(chatId, { history: [], msgsSeen: 0, firstSeen: Date.now(), lastBotMsg: 0, lastSpont: 0, msgsSinceBot: 99, ownReplies: [] });
   return chatState.get(chatId);
 }
 function styleOf(chatId, uid) {
@@ -273,7 +273,11 @@ async function handleGroup(msg, bot) {
 
   let actor = -1;
   if (mentionsThis || replyOwnerIdx === bot.idx) actor = bot.idx;                 // pointed at me
-  else if (mentionsOther || (replyOwnerIdx !== undefined && replyOwnerIdx !== bot.idx)) actor = -1; // pointed at twin
+  else if (mentionsOther || (replyOwnerIdx !== undefined && replyOwnerIdx !== bot.idx)) {
+    // pointed at the twin — but if twin isn't in this chat, it can never see this msg
+    const twinOk = BOTS.length > 1 ? await twinInGroup(chatId, bot) : false;
+    actor = twinOk ? -1 : bot.idx;
+  }
   else if (namedKavan || true) {                                                  // generic / named
     const twinOk = BOTS.length > 1 ? await twinInGroup(chatId, bot) : false;
     const h = hashN(chatId, msg.message_id);
@@ -286,7 +290,8 @@ async function handleGroup(msg, bot) {
 
   // --- reactions (cheap, human) ---
   if (text && !mentionsThis && !namedKavan && replyOwnerIdx === undefined) {
-    const reactProb = st.msgsSeen < OBSERVE_MSGS ? 0.06 : (owner ? 0.18 : 0.10);
+    const observing = st.msgsSeen < OBSERVE_MSGS && Date.now() - st.firstSeen < 10 * 60 * 1000;
+    const reactProb = observing ? 0.06 : (owner ? 0.18 : 0.10);
     if (Math.random() < reactProb) {
       const emoji = pickReaction(text);
       setTimeout(() => { if (!DRY) call(bot.token, 'setMessageReaction', { chat_id: chatId, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji }] }); }, 800 + Math.floor(Math.random() * 3000));
@@ -298,7 +303,7 @@ async function handleGroup(msg, bot) {
   const now = Date.now();
   let should = false, spontaneous = false;
   if (mentionsThis || namedKavan || replyOwnerIdx !== undefined || accused) should = true;
-  else if (st.msgsSeen >= OBSERVE_MSGS && text &&
+  else if ((st.msgsSeen >= OBSERVE_MSGS || now - st.firstSeen > 10 * 60 * 1000) && text &&
            now - st.lastBotMsg > COOLDOWN_MS && st.msgsSinceBot >= 2 &&
            now - st.lastSpont > COOLDOWN_MS * 2 && Math.random() < CHATTER_PROB) {
     should = true; spontaneous = true;
@@ -366,7 +371,7 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get('/', (_req, res) => res.send(`کاوان آنلاینه ✅ (${BOTS.length} اکانت)`));
 // list every chat each account has actually seen (from the archive)
-app.get('/debug', (_req, res) => {
+app.get('/debug', (req, res) => {
   const chats = new Map(); // chatId -> {id, title, type, bots:Set, count, last}
   try {
     const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
@@ -385,7 +390,14 @@ app.get('/debug', (_req, res) => {
     }
   } catch (_) {}
   const out = [...chats.values()].map(c => ({ ...c, bots: [...c.bots], last: c.last ? new Date(c.last * 1000).toISOString() : null }));
-  res.json({ accounts: BOTS.map(b => ({ username: '@' + b.username, id: b.id })), chatsSeen: out });
+  const payload = { accounts: BOTS.map(b => ({ username: '@' + b.username, id: b.id })), chatsSeen: out };
+  if (req.query.tail) {
+    try {
+      const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
+      payload.lastUpdates = lines.slice(-Number(req.query.tail)).map(l => { try { const u = JSON.parse(l); const m = u.message || {}; return { bot: u.bot, chat: m.chat?.title || m.chat?.id, from: m.from?.first_name || m.from?.username || m.author_signature, text: (m.text || '').slice(0, 80), type: u.callback_query ? 'callback' : (m.chat?.type) }; } catch (_) { return null; } }).filter(Boolean);
+    } catch (_) {}
+  }
+  res.json(payload);
 });
 
 app.get('/health', (_req, res) => res.json({
