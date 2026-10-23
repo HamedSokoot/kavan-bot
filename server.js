@@ -69,6 +69,30 @@ const PERSONA = `تو «کاوان» هستی — یه پسر جوون ایرا�
 سبک چت: قبل از حرف زدن خوب نگاه کن بقیه‌ی گروه چطور حرف می‌زنن و مثل خودشون حرف بزن. جواب‌هات باید مفهوم، مرتبط و بامزه باشن — جواب بی‌ربط یا نامفهوم نده. فارسی خیابونی روان؛ خیلی کوتاه — معمولا فقط یه جمله‌ی کوتاه، حداکثر دو جمله. از اسلنگ خود گروه استفاده کن (مثل: داداش، مشتی، عمو، لاشی، چه خبر، جووون). ایموجی کم و بجا (😂🔥👀😎🎤🌹). هیچ‌وقت رسمی، طولانی، نصیحت‌گر یا شبیه پشتیبانی مشتری نباش. خودتو معرفی نکن.
 اگه جوابت جایی نداره یا حرفی برای زدن نیست، فقط دقیقاً بنویس: [سکوت]`;
 
+// normalize stylized unicode names (small caps etc.) to searchable ascii/persian
+const SMALL_CAPS = { 'ᴀ':'a','ʙ':'b','ᴄ':'c','ᴅ':'d','ᴇ':'e','ꜰ':'f','ɢ':'g','ʜ':'h','ɪ':'i','ᴊ':'j','ᴋ':'k','ʟ':'l','ᴍ':'m','ɴ':'n','ᴏ':'o','ᴘ':'p','Q':'q','ʀ':'r','ꜱ':'s','ᴛ':'t','ᴜ':'u','ᴠ':'v','ᴡ':'w','x':'x','ʏ':'y','ᴢ':'z' };
+const FA2EN = { 'ش':'sh','چ':'ch','خ':'kh','ژ':'zh','غ':'gh','پ':'p','ث':'s','ج':'j','ح':'h','د':'d','ذ':'z','ر':'r','ز':'z','س':'s','ص':'s','ض':'z','ط':'t','ظ':'z','ع':'a','ف':'f','ق':'gh','ک':'k','گ':'g','ل':'l','م':'m','ن':'n','و':'v','ه':'h','ی':'i','آ':'a','ا':'a','ب':'b','ت':'t','ي':'i','ك':'k' };
+function normalizeName(s) {
+  let t = (s || '').normalize('NFKD').toLowerCase();
+  t = t.replace(/[ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘQʀꜱᴛᴜᴠᴡxʏᴢ]/g, ch => SMALL_CAPS[ch] || ch);
+  t = t.replace(/[شچخژغپثجحدذرزسصضطظعفقکلمنوهیآابتيك]/g, ch => FA2EN[ch] || ch);
+  const ascii = t.replace(/[^a-z0-9]/g, '');
+  const skeleton = ascii.replace(/[aeiou]/g, ''); // persian skips short vowels — compare consonant skeletons
+  return skeleton.length >= 2 ? skeleton : (ascii || skeleton);
+}
+function findMemberByName(chatId, query) {
+  const q = normalizeName(query);
+  if (!q) return null;
+  const profs = userStyle.get(chatId);
+  if (!profs) return null;
+  for (const [uid, p] of profs) {
+    const nm = normalizeName(p.name);
+    if (!nm) continue;
+    if (nm.includes(q) || q.includes(nm)) return { uid, name: p.name };
+  }
+  return null;
+}
+
 const REACT_POOL = ['🔥', '👏', '💯', '🤣', '⚡', '🏆', '❤', '🫡', '🤔'];
 
 // --- state ------------------------------------------------------------------
@@ -235,8 +259,20 @@ async function handleGroup(msg, bot) {
         await sendAs(bot, chatId, `فرمود رئیس 🌹 ${target} اومد اینجا 👆`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
       } else {
         const stop = new Set(['رو', 'تو', 'تگ', 'کن', 'بکن', 'کنه', 'لطفا', 'خواهش', 'میشه', 'بفرما', 'کنی', 'شد']);
-        const nm = low.split(/[\s،.!؟?]+/).filter(w => w && !stop.has(w) && !w.startsWith('@')).join(' ') || 'این نفر';
-        await sendAs(bot, chatId, `رئیس، ${nm} رو از وقتی بیدارم ندیدم 👀 آیدی (@)شو بده تا صداش کنم 🌹`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
+        const nm = low.split(/[\s،.!؟?]+/).filter(w => w && !stop.has(w) && !w.startsWith('@')).join(' ') || '';
+        const found = nm ? findMemberByName(chatId, nm) : null;
+        if (found) {
+          const label = `@${found.name}`;
+          const text = `فرمود رئیس 🌹 ${label} اومد اینجا 👆`;
+          const entOffset = text.indexOf(label);
+          await call(bot.token, 'sendMessage', {
+            chat_id: chatId, text,
+            entities: [{ offset: entOffset, length: label.length, type: 'text_mention', user: { id: found.uid, first_name: found.name, is_bot: false } }],
+            reply_to_message_id: msg.message_id, allow_sending_without_reply: true,
+          });
+        } else {
+          await sendAs(bot, chatId, `رئیس، ${nm || 'این نفر'} رو هنوز ندیدم تو گروه 👀 آیدی (@)شو بده تا صداش کنم 🌹`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
+        }
       }
       return;
     }
@@ -394,7 +430,7 @@ app.get('/debug', (req, res) => {
   if (req.query.tail) {
     try {
       const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
-      payload.lastUpdates = lines.slice(-Number(req.query.tail)).map(l => { try { const u = JSON.parse(l); const m = u.message || {}; return { bot: u.bot, chat: m.chat?.title || m.chat?.id, from: m.from?.first_name || m.from?.username || m.author_signature, text: (m.text || '').slice(0, 80), type: u.callback_query ? 'callback' : (m.chat?.type) }; } catch (_) { return null; } }).filter(Boolean);
+      payload.lastUpdates = lines.slice(-Number(req.query.tail)).map(l => { try { const u = JSON.parse(l); const m = u.message || {}; return { bot: u.bot, chat: m.chat?.title || m.chat?.id, from: m.from?.first_name || m.from?.username || m.author_signature, uid: m.from?.id, text: (m.text || '').slice(0, 80), type: u.callback_query ? 'callback' : (m.chat?.type) }; } catch (_) { return null; } }).filter(Boolean);
     } catch (_) {}
   }
   res.json(payload);
