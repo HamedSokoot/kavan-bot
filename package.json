@@ -1,6 +1,6 @@
 {
   "name": "kavan-bot",
-  "version": "3.6.2",
+  "version": "3.6.0",
   "description": "Kavan v3 — dual-token, human-like Telegram group member",
   "type": "module",
   "main": "server.js",

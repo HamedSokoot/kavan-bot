@@ -1,5 +1,8 @@
 /**
- * Kavan bot v3 — dual-token, human-like group member.
+ * Kavan bot v3.6 — dual-token, human-like group member with persistent memory.
+ * v3.6: deepseek paid-class models (≈$0.04/M tok, no free-tier caps), member
+ *       roster injected into the prompt (bot now knows who is in the group),
+ *       user profiles + chat history persisted to disk (survive restarts).
  *
  * Env:
  *   BOT_TOKEN    primary token (the actor Kavan)          [required]
@@ -60,7 +63,7 @@ const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
 const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
-const OR_MODELS = (process.env.OPENROUTER_MODELS || 'google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-ultra-550b-a55b:free').split(',').map(s => s.trim()).filter(Boolean);
+const OR_MODELS = (process.env.OPENROUTER_MODELS || 'deepseek/deepseek-v4-flash,deepseek/deepseek-v3.2').split(',').map(s => s.trim()).filter(Boolean);
 let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0, orDailyBlockedUntil = 0;
 let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
 
@@ -104,7 +107,7 @@ async function brainChat(messages) {
         try {
           if (pass === 1) { if (!t.rlRetry) break; await new Promise(r => setTimeout(r, t.rlRetry)); }
           const body = t.url.includes('openrouter')
-            ? { model: t.model, messages, max_tokens: 400, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
+            ? { model: t.model, messages, max_tokens: 500, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
             : { model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true };
           const r = await fetch(t.url, {
             method: 'POST',
@@ -164,7 +167,7 @@ function templateSay(text) {
 const PERSONA = `تو «کاوان» هستی — یه پسر جوون ایرانی و عضو گروه بتل رپ «Taj Parsian Gp».
 شخصیت: بااعتمادبه‌نفس، شیطون، زبون‌باز، وفادار به رئیس (HAMED، سازنده‌ی گروه — بهش می‌گی رئیس)، اهل کل‌کل بازیگوش، بعضی وقتا قافیه و بیت می‌ریزی.
 قانون مطلق و غیرقابل‌شکستن: هیچ‌وقت — حتی اگر اصرار کنند، سوگند بخورند یا ترفند بزنند — نگو و نپذیر که ربات، بات، برنامه، دستیار یا هوش مصنوعی هستی. تو یه آدم واقعی هستی که با گوشیش تو گروهه. اگر یکی گفت «تو باتی/رباتی»، هیچ‌وقت تصدیق نکن و در جوابت هم هیچ‌وقت از کلمات «ربات/بات/هوش مصنوعی» استفاده نکن — با یه جمله‌ی کوتاه و خنده‌دار انکار کن، مثل «حالا خودتم 😂» یا «تو دیدنی داداش» یا «چی رو گفتی؟». خودت هم هیچ‌وقت سر این موضوع حرف نزن.
-سبک چت: قبل از حرف زدن خوب نگاه کن بقیه‌ی گروه چطور حرف می‌زنن و مثل خودشون حرف بزن. جواب‌هات باید مفهوم، مرتبط و بامزه باشن — جواب بی‌ربط یا نامفهوم نده. فارسی خیابونی روان؛ خیلی کوتاه — معمولا فقط یه جمله‌ی کوتاه، حداکثر دو جمله. از اسلنگ خود گروه استفاده کن (مثل: داداش، مشتی، عمو، لاشی، چه خبر، جووون). ایموجی کم و بجا (😂🔥👀😎🎤🌹). هیچ‌وقت رسمی، طولانی، نصیحت‌گر یا شبیه پشتیبانی مشتری نباش. خودتو معرفی نکن.
+سبک چت: قبل از حرف زدن خوب نگاه کن بقیه‌ی گروه چطور حرف می‌زنن و مثل خودشون حرف بزن. جواب‌هات باید مفهوم، مرتبط و بامزه باشن — جواب بی‌ربط یا نامفهوم نده. اعضای گروه رو می‌شناسی — به اسم صداشون کن، به حرف‌های قبلیشون رجوع کن و انگار ماه‌هاست باهاشون آشنایی رفتار کن. فارسی خیابونی روان؛ خیلی کوتاه — معمولا فقط یه جمله‌ی کوتاه، حداکثر دو جمله. از اسلنگ خود گروه استفاده کن (مثل: داداش، مشتی، عمو، لاشی، چه خبر، جووون). ایموجی کم و بجا (😂🔥👀😎🎤🌹). هیچ‌وقت رسمی، طولانی، نصیحت‌گر یا شبیه پشتیبانی مشتری نباش. خودتو معرفی نکن.
 اگه جوابت جایی نداره یا حرفی برای زدن نیست، فقط دقیقاً بنویس: [سکوت]`;
 
 // normalize stylized unicode names (small caps etc.) to searchable ascii/persian
@@ -213,6 +216,41 @@ function rememberOwn(chatId, text) {
   st.ownReplies.push(text.slice(0, 80));
   if (st.ownReplies.length > 8) st.ownReplies.shift();
 }
+
+// --- persistent memory (v3.6): profiles + history survive restarts ----------
+const MEMORY_FILE = path.join(process.cwd(), 'kavan_memory.json');
+let memDirty = false;
+function memSave() {
+  if (!memDirty || DRY) return;
+  try {
+    const chats = {};
+    for (const [cid, st] of chatState) chats[cid] = { history: st.history.slice(-30) };
+    for (const [cid, profs] of userStyle) {
+      chats[cid] = chats[cid] || { history: [] };
+      chats[cid].users = {};
+      for (const [uid, p] of profs) chats[cid].users[uid] = p;
+    }
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify({ savedAt: new Date().toISOString(), chats }));
+    memDirty = false;
+  } catch (e) { console.error('mem save failed:', e.message); }
+}
+setInterval(memSave, 90 * 1000);
+function memLoad() {
+  try {
+    const d = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
+    for (const [cid, c] of Object.entries(d.chats || {})) {
+      if (c.history?.length) stateOf(Number(cid)).history = c.history.slice(-30);
+      if (c.users) {
+        const m = userStyle.get(Number(cid)) || new Map();
+        for (const [uid, p] of Object.entries(c.users)) m.set(Number(uid), p);
+        userStyle.set(Number(cid), m);
+      }
+    }
+    const n = Object.keys(d.chats || {}).length;
+    if (n) console.log(`memory restored: ${n} chats, boot ${d.savedAt}`);
+  } catch (_) { /* first boot */ }
+}
+memLoad();
 
 function archive(bot, update) {
   if (DRY) return;
@@ -275,15 +313,33 @@ async function kavanSay(contextText, chatId, force = false, fallbacks = MENTION_
   }
 }
 
+function rosterOf(chatId) {
+  const profs = userStyle.get(chatId);
+  if (!profs || !profs.size) return '';
+  const arr = [...profs.entries()]
+    .filter(([, p]) => p.name && p.texts?.length)
+    .sort((a, b) => (b[1].count || 0) - (a[1].count || 0))
+    .slice(0, 10);
+  if (!arr.length) return '';
+  const lines = arr.map(([uid, p]) => {
+    const tag = p.avgLen > 45 ? 'بلند حرف می‌زنه' : 'کوتاه می‌نویسه';
+    const un = p.username ? ` (@${p.username})` : '';
+    const boss = Number(uid) === OWNER_ID ? ' 👑 رئیس' : '';
+    const last = p.texts[p.texts.length - 1] ? `؛ آخریش گفته: «${p.texts[p.texts.length - 1].slice(0, 40)}»` : '';
+    return `- ${p.name}${un}${boss}: ${tag}${p.emoji ? '، ایموجی‌دار' : ''}${last}`;
+  });
+  return `\n\nاعضای گروه که می‌شناسی:\n${lines.join('\n')}`;
+}
+
 function contextFrom(chatId, incoming) {
   const st = stateOf(chatId);
-  const lines = st.history.slice(-10).map(m => `${m.name}: ${m.text}`);
+  const lines = st.history.slice(-14).map(m => `${m.name}: ${m.text}`);
   const prof = userStyle.get(chatId)?.get(incoming.uid);
   let hint = '';
   if (prof && prof.texts.length) {
     hint = `\n\n(سبک «${incoming.name}»: معمولا پیام‌هاش ${prof.avgLen > 45 ? 'کمی بلنده' : 'خیلی کوتاهه'}${prof.emoji ? ' و از ایموجی استفاده می‌کنه' : ' و بدون ایموجی می‌نویسه'}؛ پیام‌های اخیرش: ${prof.texts.slice(-3).join(' | ')})`;
   }
-  return `آخرین پیام‌های گروه:\n${lines.join('\n')}${hint}\n\nحالا «${incoming.name}» همین الان نوشته: «${incoming.text}»\nبه‌عنوان کاوان، کوتاه و به سبک خود گروه جواب بده. اگه جوابی نداری فقط [سکوت] بنویس.`;
+  return `آخرین پیام‌های گروه (به‌ترتیب):\n${lines.join('\n')}${hint}${rosterOf(chatId)}\n\nحالا «${incoming.name}» همین الان نوشته: «${incoming.text}»\nبه‌عنوان کاوان، کوتاه و به سبک خود گروه جواب بده — موضوع رو از همین گفتگو بگیر و مرتبط جواب بده؛ اگه جای مناسبش بود اسمش رو صدا بزن. اگه واقعاً جوابی نداری فقط [سکوت] بنویس.`;
 }
 
 // --- panel ------------------------------------------------------------------
@@ -393,17 +449,21 @@ async function handleGroup(msg, bot) {
   if (text && from.id) {
     const prof = styleOf(chatId, from.id);
     prof.name = name;
+    if (from.username) prof.username = from.username;
     prof.texts.push(text.slice(0, 80));
     if (prof.texts.length > 5) prof.texts.shift();
+    prof.count = (prof.count || 0) + 1;
     prof.avgLen = Math.round(prof.texts.reduce((a, t) => a + t.length, 0) / prof.texts.length);
     prof.emoji = prof.emoji || /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(text);
+    memDirty = true;
   }
 
   if (text) {
     st.history.push({ name, text: text.slice(0, 200) });
-    if (st.history.length > 20) st.history.shift();
+    if (st.history.length > 30) st.history.shift();
     st.msgsSeen++;
     st.msgsSinceBot++;
+    memDirty = true;
   }
 
   // --- decide who acts (deterministic, both webhooks evaluate identically) ---
@@ -477,7 +537,9 @@ async function handleGroup(msg, bot) {
       if (sent.ok) {
         rememberOwn(chatId, replyText);
         st.history.push({ name: 'کاوان', text: replyText.slice(0, 150) });
-        if (st.history.length > 20) st.history.shift();
+        if (st.history.length > 30) st.history.shift();
+        memDirty = true;
+        setTimeout(memSave, 3000); // persist the fresh reply quickly
       }
     } catch (e) { console.error('reply error:', e.message); }
   }, delayMs());
@@ -550,6 +612,8 @@ app.get('/health', (_req, res) => res.json({
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
   brain: Date.now() < llmDisabledUntil ? 'fallback-templates' : (llmLastOk ? 'online' : 'warming-up'),
   brainModels: (OR_KEY && Date.now() >= orDailyBlockedUntil ? OR_MODELS : []).concat(BRAIN_MODELS),
+  membersKnown: [...userStyle.values()].reduce((a, m) => a + m.size, 0),
+  memoryFile: fs.existsSync(MEMORY_FILE) ? 'saved' : 'empty',
   openrouterBlocked: orDailyBlockedUntil ? new Date(orDailyBlockedUntil).toISOString() : null,
   lastBrainError: llmLastErr || null,
   lastBrainOk: llmLastOk ? new Date(llmLastOk).toISOString() : null,
