@@ -60,7 +60,7 @@ const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
 const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
-const OR_MODELS = (process.env.OPENROUTER_MODELS || 'google/gemma-4-31b-it:free,nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-26b-a4b-it:free').split(',').map(s => s.trim()).filter(Boolean);
+const OR_MODELS = (process.env.OPENROUTER_MODELS || 'google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free,nvidia/nemotron-3-ultra-550b-a55b:free').split(',').map(s => s.trim()).filter(Boolean);
 let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0, orDailyBlockedUntil = 0;
 let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
 
@@ -104,7 +104,7 @@ async function brainChat(messages) {
         try {
           if (pass === 1) { if (!t.rlRetry) break; await new Promise(r => setTimeout(r, t.rlRetry)); }
           const body = t.url.includes('openrouter')
-            ? { model: t.model, messages, max_tokens: 150, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
+            ? { model: t.model, messages, max_tokens: 400, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
             : { model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true };
           const r = await fetch(t.url, {
             method: 'POST',
