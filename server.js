@@ -60,9 +60,30 @@ const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
 const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
-const OR_MODELS = (process.env.OPENROUTER_MODELS || 'nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free').split(',').map(s => s.trim()).filter(Boolean);
+const OR_MODELS = (process.env.OPENROUTER_MODELS || 'google/gemma-4-31b-it:free,nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-26b-a4b-it:free').split(',').map(s => s.trim()).filter(Boolean);
 let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0, orDailyBlockedUntil = 0;
 let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
+
+// reasoning models sometimes leak their chain-of-thought as the reply — clean or reject
+function cleanReply(txt) {
+  if (!txt) return null;
+  let t = txt.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+  if (!t) return null;
+  const langCheck = s => {
+    const fa = (s.match(/[\u0600-\u06FF]/g) || []).length;
+    const la = (s.match(/[A-Za-z]/g) || []).length;
+    return fa > la; // Persian-dominant?
+  };
+  if (/^(the user|we need|okay|let's|i need|first,|looking at)/i.test(t) || /\n\n(the user|we need|let's)/i.test(t)) {
+    // chain-of-thought leaked before the answer → keep only the last paragraph if Persian
+    const parts = t.split(/\n{2,}/);
+    const tail = (parts[parts.length - 1] || '').trim();
+    if (tail && langCheck(tail)) t = tail; else return null;
+  } else if (!langCheck(t)) {
+    return null; // English-dominant → reasoning leak / wrong language
+  }
+  return t;
+}
 
 async function brainChat(messages) {
   if (Date.now() < llmDisabledUntil) throw new Error('brain cooling down');
@@ -83,7 +104,7 @@ async function brainChat(messages) {
         try {
           if (pass === 1) { if (!t.rlRetry) break; await new Promise(r => setTimeout(r, t.rlRetry)); }
           const body = t.url.includes('openrouter')
-            ? { model: t.model, messages, max_tokens: 120, temperature: 0.95 }
+            ? { model: t.model, messages, max_tokens: 150, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
             : { model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true };
           const r = await fetch(t.url, {
             method: 'POST',
@@ -96,8 +117,8 @@ async function brainChat(messages) {
             throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''} ${errBody.replace(/\s+/g, ' ')}`);
           }
           const c = await r.json();
-          const txt = (c?.choices?.[0]?.message?.content || '').trim();
-          if (!txt) throw new Error('empty content');
+          const txt = cleanReply(c?.choices?.[0]?.message?.content || '');
+          if (!txt) throw new Error('empty or leaked content');
           llmFails = 0; llmLastOk = Date.now(); llmLastErr = '';
           return txt;
         } catch (e) {
