@@ -58,7 +58,7 @@ const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 // sandbox; on Render every call died with UND_ERR_CONNECT_TIMEOUT. Use a free
 // no-key endpoint instead, serialize calls, and keep a template fallback.
 const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
-const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai,openai-fast,mistral').split(',').map(s => s.trim()).filter(Boolean);
+const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
 let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0;
 let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
@@ -82,8 +82,8 @@ async function brainChat(messages) {
           const r = await fetch(t.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...t.hdr },
-            body: JSON.stringify({ model: t.model, messages, max_tokens: 120, temperature: 0.95, referrer: 'kavan-bot', private: true }),
-            signal: AbortSignal.timeout(20000),
+            body: JSON.stringify({ model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true }),
+            signal: AbortSignal.timeout(25000),
           });
           if (!r.ok) throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''}`);
           const c = await r.json();
@@ -194,10 +194,17 @@ function mentionsBot(text) {
 
 const MENTION_FALLBACKS = ['جانم؟ 👀', 'گو داداش', 'بله؟ 😎', 'چه خبر؟', 'بعله؟'];
 const ACCUSE_FALLBACKS = ['حالا خودتم 😂', 'تو دیدنی داداش', 'چی رو گفتی 😂', 'برو بابا 😎'];
+const lastFb = new Map(); // chatId -> last fallback text (avoid repeats)
 
 async function kavanSay(contextText, chatId, force = false, fallbacks = MENTION_FALLBACKS, rawText = '') {
   // returns reply text or null ([سکوت] / failure / bot-talk after retry). NEVER throws.
-  const pickFb = () => fallbacks[Math.floor(Math.random() * fallbacks.length)];
+  const pickFb = () => {
+    const prev = lastFb.get(chatId);
+    let t = fallbacks[Math.floor(Math.random() * fallbacks.length)];
+    if (fallbacks.length > 1 && t === prev) t = fallbacks[(fallbacks.indexOf(t) + 1) % fallbacks.length];
+    lastFb.set(chatId, t);
+    return t;
+  };
   const fb = () => (force ? pickFb() : null);
   const ctx = force
     ? contextText + '\n\n(این پیام مستقیم به توئه — حتماً یه جواب کوتاه طبیعی بده؛ [سکوت] اینجا مجاز نیست.)'
