@@ -60,7 +60,8 @@ const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
 const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
 const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
 const OR_KEY = process.env.OPENROUTER_API_KEY || '';
-let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0;
+const OR_MODELS = (process.env.OPENROUTER_MODELS || 'nvidia/nemotron-3-ultra-550b-a55b:free,google/gemma-4-31b-it:free,google/gemma-4-26b-a4b-it:free').split(',').map(s => s.trim()).filter(Boolean);
+let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0, orDailyBlockedUntil = 0;
 let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
 
 async function brainChat(messages) {
@@ -71,21 +72,29 @@ async function brainChat(messages) {
     llmLastCall = Date.now();
     let lastErr;
     const targets = [];
-    if (OR_KEY) targets.push({ url: 'https://openrouter.ai/api/v1/chat/completions', model: 'google/gemini-2.0-flash-001', hdr: { Authorization: `Bearer ${OR_KEY}` } });
-    for (const model of BRAIN_MODELS) targets.push({ url: BRAIN_URL, model, hdr: {} });
+    if (OR_KEY && Date.now() >= orDailyBlockedUntil) {
+      for (const m of OR_MODELS) targets.push({ url: 'https://openrouter.ai/api/v1/chat/completions', model: m, hdr: { Authorization: `Bearer ${OR_KEY}`, 'X-Title': 'Kavan Bot' }, rlRetry: 4000 });
+      targets[0].rlRetry = 4000; targets.slice(1).forEach(t => t.rlRetry = 0);
+    }
+    BRAIN_MODELS.forEach((model, i) => targets.push({ url: BRAIN_URL, model, hdr: {}, rlRetry: i === 0 ? 31000 : 0 }));
     for (const t of targets) {
-      // two passes per target: first try, then one slow retry on rate-limit
+      // two passes per target: first try, then one short/long retry on rate-limit (per-target policy)
       for (let pass = 0; pass < 2; pass++) {
-        if (pass === 1 && t !== targets[0]) break; // slow rate-limit retry only for primary target
         try {
-          if (pass === 1) await new Promise(r => setTimeout(r, 31000)); // anonymous quota window
+          if (pass === 1) { if (!t.rlRetry) break; await new Promise(r => setTimeout(r, t.rlRetry)); }
+          const body = t.url.includes('openrouter')
+            ? { model: t.model, messages, max_tokens: 120, temperature: 0.95 }
+            : { model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true };
           const r = await fetch(t.url, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', ...t.hdr },
-            body: JSON.stringify({ model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true }),
+            body: JSON.stringify(body),
             signal: AbortSignal.timeout(25000),
           });
-          if (!r.ok) throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''}`);
+          if (!r.ok) {
+            const errBody = (await r.text().catch(() => '')).slice(0, 180);
+            throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''} ${errBody.replace(/\s+/g, ' ')}`);
+          }
           const c = await r.json();
           const txt = (c?.choices?.[0]?.message?.content || '').trim();
           if (!txt) throw new Error('empty content');
@@ -93,8 +102,14 @@ async function brainChat(messages) {
           return txt;
         } catch (e) {
           lastErr = e;
-          const rl = /\+rl/.test(e.message || '');
-          console.error(`brain miss [${t.model}] pass${pass}:`, e.message);
+          const msg = e.message || '';
+          if (/free-models-per-(day|minute)/.test(msg)) {
+            orDailyBlockedUntil = Date.now() + 30 * 60 * 1000;
+            console.error('openrouter free-tier cap — skipping openrouter for 30min');
+            break;
+          }
+          const rl = /\+rl/.test(msg);
+          console.error(`brain miss [${t.model}] pass${pass}:`, msg.slice(0, 140));
           if (!rl) break; // non-rate-limit errors: move to next model immediately
         }
       }
@@ -513,24 +528,31 @@ app.get('/debug', (req, res) => {
 app.get('/health', (_req, res) => res.json({
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
   brain: Date.now() < llmDisabledUntil ? 'fallback-templates' : (llmLastOk ? 'online' : 'warming-up'),
-  brainModels: (OR_KEY ? ['openrouter'] : []).concat(BRAIN_MODELS),
+  brainModels: (OR_KEY && Date.now() >= orDailyBlockedUntil ? OR_MODELS : []).concat(BRAIN_MODELS),
+  openrouterBlocked: orDailyBlockedUntil ? new Date(orDailyBlockedUntil).toISOString() : null,
   lastBrainError: llmLastErr || null,
   lastBrainOk: llmLastOk ? new Date(llmLastOk).toISOString() : null,
   dryrun: DRY,
 }));
 
-// connectivity probe: does the LLM endpoint work from THIS host right now?
+// connectivity probe: do the LLM endpoints work from THIS host right now?
 app.get('/nettest', async (_req, res) => {
-  const t0 = Date.now();
-  try {
-    const r = await fetch(BRAIN_URL, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'openai-fast', messages: [{ role: 'user', content: 'salam' }], max_tokens: 10 }),
-      signal: AbortSignal.timeout(15000),
-    });
-    const body = await r.text();
-    res.json({ ok: r.ok, status: r.status, ms: Date.now() - t0, sample: body.slice(0, 160) });
-  } catch (e) { res.json({ ok: false, error: e.message, ms: Date.now() - t0 }); }
+  const out = {};
+  const probe = async (name, url, model, hdr) => {
+    const t0 = Date.now();
+    try {
+      const r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...hdr },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'salam' }], max_tokens: 10 }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const body = await r.text();
+      out[name] = { ok: r.ok, status: r.status, ms: Date.now() - t0, sample: body.slice(0, 120) };
+    } catch (e) { out[name] = { ok: false, error: e.message, ms: Date.now() - t0 }; }
+  };
+  if (OR_KEY && Date.now() >= orDailyBlockedUntil) await probe('openrouter', 'https://openrouter.ai/api/v1/chat/completions', OR_MODELS[0], { Authorization: `Bearer ${OR_KEY}` });
+  await probe('pollinations', BRAIN_URL, BRAIN_MODELS[0], {});
+  res.json(out);
 });
 
 const routeFor = idx => (req, res) => {
