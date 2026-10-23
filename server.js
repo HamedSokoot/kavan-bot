@@ -365,6 +365,29 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/', (_req, res) => res.send(`کاوان آنلاینه ✅ (${BOTS.length} اکانت)`));
+// list every chat each account has actually seen (from the archive)
+app.get('/debug', (_req, res) => {
+  const chats = new Map(); // chatId -> {id, title, type, bots:Set, count, last}
+  try {
+    const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
+    for (const line of lines) {
+      try {
+        const u = JSON.parse(line);
+        const m = u.message || u.my_chat_member?.chat || u.callback_query?.message;
+        if (!m?.chat || m.chat.type === 'private') continue;
+        const c = m.chat;
+        const rec = chats.get(c.id) || { id: c.id, title: c.title || c.username || '?', type: c.type, bots: new Set(), count: 0, last: null };
+        if (u.bot) rec.bots.add(u.bot);
+        rec.count++;
+        rec.last = u.message?.date || rec.last;
+        chats.set(c.id, rec);
+      } catch (_) {}
+    }
+  } catch (_) {}
+  const out = [...chats.values()].map(c => ({ ...c, bots: [...c.bots], last: c.last ? new Date(c.last * 1000).toISOString() : null }));
+  res.json({ accounts: BOTS.map(b => ({ username: '@' + b.username, id: b.id })), chatsSeen: out });
+});
+
 app.get('/health', (_req, res) => res.json({
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
   brain: zai ? 'online' : 'template',
