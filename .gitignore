@@ -1,3 +1,7 @@
 node_modules/
 kavan_archive.jsonl
 __pycache__/
+# private memory — MUST NOT go to the public repo (spec §14/rule 9)
+kavan_db.json
+kavan_memory.json
+kavan_db.json.tmp

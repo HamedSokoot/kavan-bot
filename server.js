@@ -1,36 +1,42 @@
 /**
- * Kavan bot v3.6 — dual-token, human-like group member with persistent memory.
- * v3.6: deepseek paid-class models (≈$0.04/M tok, no free-tier caps), member
- *       roster injected into the prompt (bot now knows who is in the group),
- *       user profiles + chat history persisted to disk (survive restarts).
+ * Kavan bot v4.0 — dual-token human-like group member with structured memory.
+ *
+ * Architecture (spec §16 pipeline), one responsibility per module:
+ *   lib/env.js          shared runtime config (secrets only via env vars)
+ *   lib/normalizer.js   Persian NLP: char/ZWNJ/diacritics/skeleton matching (§8)
+ *   lib/store.js        durable storage: local JSON + private GitHub repo sync (§2.5, §15)
+ *   lib/db.js           entities: users/aliases/profiles/memories/learned/events/privacy (§1,§2,§3,§7,§15)
+ *   lib/events.js       group event detection: joins/leaves/fights/agreements (§6)
+ *   lib/relations.js    friendship/trust/conflict indices + romance FSM (§5, §12)
+ *   lib/nlu.js          Persian intent detection + param extraction (§10)
+ *   lib/intent-handlers.js  real tool executors behind intents (§10.3)
+ *   lib/persona.js      personality + tone adaptation + prompt assembly (§4)
+ *   lib/brain.js        LLM chain: OpenRouter deepseek → Pollinations, fallbacks (§15.4)
  *
  * Env:
- *   BOT_TOKEN    primary token (the actor Kavan)          [required]
- *   BOT2_TOKEN   secondary token (backup account)         [optional]
- *   OWNER_ID     owner user id (default 6252224878)
- *   BRAIN_URL    LLM endpoint (default https://text.pollinations.ai/openai, no key)
- *   OPENROUTER_API_KEY  optional stronger brain (used first when present)
- *   CHATTER_PROBABILITY  0..1 spontaneous reply chance (default 0.35)
- *   COOLDOWN_SECONDS     min secs between spontaneous replies (default 45)
- *   OBSERVE_MSGS         msgs to silently watch after boot (default 12)
- *   KAVAN_DRYRUN=1       log instead of sending (testing)
- *
- * Rules baked in:
- *   - NEVER says/accepts being a bot or AI. Hard filter strips/regenerates such text.
- *   - Observes the chat first (OBSERVE_MSGS), mirrors each user's style.
- *   - Both tokens share one persona; a deterministic hash picks the actor so the
- *     two accounts never double-reply to the same message.
+ *   BOT_TOKEN / BOT2_TOKEN   Telegram bot tokens           [required]
+ *   OWNER_ID                 owner user id
+ *   OPENROUTER_API_KEY       stronger brain (used first)   [recommended]
+ *   OPENROUTER_MODELS        models list (default deepseek-v4-flash,deepseek-v3.2)
+ *   GITHUB_TOKEN/GITHUB_REPO private repo for memory sync  [recommended]
+ *   CHATTER_PROBABILITY, COOLDOWN_SECONDS, OBSERVE_MSGS, HOURLY_MSG_CAP
+ *   KAVAN_DRYRUN=1           log instead of sending (testing)
  */
 import express from 'express';
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
-const OWNER_ID = Number(process.env.OWNER_ID || 6252224878);
-const OWNER_SIG = 'HAMED'; // anonymous-admin signature of the owner
-const DRY = process.env.KAVAN_DRYRUN === '1';
-const CHATTER_PROB = Number(process.env.CHATTER_PROBABILITY ?? '0.35');
-const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS ?? '45') * 1000;
-const OBSERVE_MSGS = Number(process.env.OBSERVE_MSGS ?? '6');
+import * as store from './lib/store.js';
+import * as db from './lib/db.js';
+import * as events from './lib/events.js';
+import * as rel from './lib/relations.js';
+import * as nlu from './lib/nlu.js';
+import * as handlers from './lib/intent-handlers.js';
+import * as persona from './lib/persona.js';
+import * as brain from './lib/brain.js';
+import { polish, mentionsBot, MENTION_FALLBACKS, ACCUSE_FALLBACKS, pickFb } from './lib/polish.js';
+import { OWNER_ID, OWNER_SIG, DRY, CHATTER_PROB, COOLDOWN_MS, OBSERVE_MSGS, HOURLY_MSG_CAP } from './lib/env.js';
+import { normalize, hardStop } from './lib/normalizer.js';
+
 const ARCHIVE = path.join(process.cwd(), 'kavan_archive.jsonl');
 
 // --- telegram ---------------------------------------------------------------
@@ -45,7 +51,7 @@ async function call(token, method, params) {
 }
 
 // --- bots -------------------------------------------------------------------
-const BOTS = []; // {idx, token, id, username, name}
+const BOTS = [];
 for (const tok of [process.env.BOT_TOKEN, process.env.BOT2_TOKEN]) {
   if (!tok) continue;
   const me = await call(tok, 'getMe', {});
@@ -54,203 +60,35 @@ for (const tok of [process.env.BOT_TOKEN, process.env.BOT2_TOKEN]) {
 }
 if (!BOTS.length) { console.error('FATAL: no valid bot token'); process.exit(1); }
 const botById = id => BOTS.find(b => b.id === id);
-const PRIMARY = 0; // env BOT_TOKEN = the token the owner wants Kavan on
+const PRIMARY = 0;
 
-// --- LLM brain (v3.5) -------------------------------------------------------
-// The z-ai-web-dev-sdk endpoint (internal-api.z.ai) is only reachable from the
-// sandbox; on Render every call died with UND_ERR_CONNECT_TIMEOUT. Use a free
-// no-key endpoint instead, serialize calls, and keep a template fallback.
-const BRAIN_URL = process.env.BRAIN_URL || 'https://text.pollinations.ai/openai';
-const BRAIN_MODELS = (process.env.BRAIN_MODELS || 'openai-fast,openai').split(',').map(s => s.trim()).filter(Boolean);
-const OR_KEY = process.env.OPENROUTER_API_KEY || '';
-const OR_MODELS = (process.env.OPENROUTER_MODELS || 'deepseek/deepseek-v4-flash,deepseek/deepseek-v3.2').split(',').map(s => s.trim()).filter(Boolean);
-let llmFails = 0, llmDisabledUntil = 0, llmLastOk = 0, llmLastErr = 'never called', llmLastCall = 0, orDailyBlockedUntil = 0;
-let llmChain = Promise.resolve(); // serialize: one request at a time (per-IP limits)
+// --- boot: storage (local → remote → migrate old format) --------------------
+store.load();
+const pulled = await store.pullRemote(store.getData());
+console.log('storage:', JSON.stringify({ ...pulled, backend: store.status().backend }));
+migrateOldMemory();
+store.startAutoSync();
 
-// reasoning models sometimes leak their chain-of-thought as the reply — clean or reject
-function cleanReply(txt) {
-  if (!txt) return null;
-  let t = txt.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
-  if (!t) return null;
-  const langCheck = s => {
-    const fa = (s.match(/[\u0600-\u06FF]/g) || []).length;
-    const la = (s.match(/[A-Za-z]/g) || []).length;
-    return fa > la; // Persian-dominant?
-  };
-  if (/^(the user|we need|okay|let's|i need|first,|looking at)/i.test(t) || /\n\n(the user|we need|let's)/i.test(t)) {
-    // chain-of-thought leaked before the answer → keep only the last paragraph if Persian
-    const parts = t.split(/\n{2,}/);
-    const tail = (parts[parts.length - 1] || '').trim();
-    if (tail && langCheck(tail)) t = tail; else return null;
-  } else if (!langCheck(t)) {
-    return null; // English-dominant → reasoning leak / wrong language
-  }
-  return t;
-}
-
-async function brainChat(messages) {
-  if (Date.now() < llmDisabledUntil) throw new Error('brain cooling down');
-  const run = async () => {
-    const gap = Date.now() - llmLastCall;
-    if (gap < 3200) await new Promise(r => setTimeout(r, 3200 - gap));
-    llmLastCall = Date.now();
-    let lastErr;
-    const targets = [];
-    if (OR_KEY && Date.now() >= orDailyBlockedUntil) {
-      for (const m of OR_MODELS) targets.push({ url: 'https://openrouter.ai/api/v1/chat/completions', model: m, hdr: { Authorization: `Bearer ${OR_KEY}`, 'X-Title': 'Kavan Bot' }, rlRetry: 4000 });
-      targets[0].rlRetry = 4000; targets.slice(1).forEach(t => t.rlRetry = 0);
-    }
-    BRAIN_MODELS.forEach((model, i) => targets.push({ url: BRAIN_URL, model, hdr: {}, rlRetry: i === 0 ? 31000 : 0 }));
-    for (const t of targets) {
-      // two passes per target: first try, then one short/long retry on rate-limit (per-target policy)
-      for (let pass = 0; pass < 2; pass++) {
-        try {
-          if (pass === 1) { if (!t.rlRetry) break; await new Promise(r => setTimeout(r, t.rlRetry)); }
-          const body = t.url.includes('openrouter')
-            ? { model: t.model, messages, max_tokens: 500, temperature: 0.95, reasoning: { effort: 'low', exclude: true } }
-            : { model: t.model, messages, max_tokens: 120, temperature: 0.95, reasoning_effort: 'low', referrer: 'kavan-bot', private: true };
-          const r = await fetch(t.url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', ...t.hdr },
-            body: JSON.stringify(body),
-            signal: AbortSignal.timeout(25000),
-          });
-          if (!r.ok) {
-            const errBody = (await r.text().catch(() => '')).slice(0, 180);
-            throw new Error(`http ${r.status}${r.status === 402 || r.status === 429 ? '+rl' : ''} ${errBody.replace(/\s+/g, ' ')}`);
-          }
-          const c = await r.json();
-          const txt = cleanReply(c?.choices?.[0]?.message?.content || '');
-          if (!txt) throw new Error('empty or leaked content');
-          llmFails = 0; llmLastOk = Date.now(); llmLastErr = '';
-          return txt;
-        } catch (e) {
-          lastErr = e;
-          const msg = e.message || '';
-          if (/free-models-per-(day|minute)/.test(msg)) {
-            orDailyBlockedUntil = Date.now() + 30 * 60 * 1000;
-            console.error('openrouter free-tier cap — skipping openrouter for 30min');
-            break;
-          }
-          const rl = /\+rl/.test(msg);
-          console.error(`brain miss [${t.model}] pass${pass}:`, msg.slice(0, 140));
-          if (!rl) break; // non-rate-limit errors: move to next model immediately
+// old v3.6 kavan_memory.json → structured db (one-time, §15 controlled migration)
+function migrateOldMemory() {
+  if (Object.keys(db.db().users || {}).length) return;
+  try {
+    const old = JSON.parse(fs.readFileSync(path.join(process.cwd(), 'kavan_memory.json'), 'utf-8'));
+    let migrated = 0;
+    for (const [cid, c] of Object.entries(old.chats || {})) {
+      for (const [uid, p] of Object.entries(c.users || {})) {
+        db.ensureUser(uid, p.name, p.username);
+        const u = db.getUser(uid);
+        if (u && p.texts?.length) {
+          u.groups[cid] = { count: p.texts.length * 3, emoji: !!p.emoji, avgLen: p.avgLen || 20, lastTexts: p.texts.slice(-5) };
+          migrated++;
         }
       }
+      if (c.history?.length) db.db().chatHistory[cid] = c.history.slice(-30).map(h => ({ name: h.name, uid: 0, text: h.text, t: Date.now() - 3600e3 }));
     }
-    llmFails++; llmLastErr = lastErr?.message || 'unknown';
-    if (llmFails >= 3) { llmDisabledUntil = Date.now() + 3 * 60 * 1000; llmFails = 0; console.error('brain disabled for 3min after repeated failures'); }
-    throw lastErr || new Error('all brain targets failed');
-  };
-  const p = llmChain.then(run, run);
-  llmChain = p.catch(() => {});
-  return p;
+    if (migrated) { store.markDirty(); store.persistLocal(); console.log(`migrated old memory: ${migrated} user-records`); }
+  } catch (_) { /* no old file */ }
 }
-
-// offline fallback: light pattern replies, always in character
-const TPL = {
-  greet: ['سلام داداش 🔥', 'سلاممم 👋 چه خبر؟', 'سلام جووون 👀', 'درود مشتی 😎'],
-  how: ['خوبیم داداش، تو چطوری؟ 😎', 'قربونت، تو چیکاری؟ 👀', 'مرسی داداش تو خوبی؟'],
-  laugh: ['خخخخخ 😂', 'وای خدای من 😂😂', 'نکش داداش خخ 😭', 'جون مادرت خفن کردی 😂'],
-  q: ['والا خودمم موندم 😂', 'راستش نمیدونم داداش 😅', 'شاید بابا 👀', 'معلومه دیگه 😎'],
-};
-function templateSay(text) {
-  const t = text || '';
-  const pick = a => a[Math.floor(Math.random() * a.length)];
-  if (/^سلام|درود|هلو|هلو|hi\b|hello/i.test(t)) return pick(TPL.greet);
-  if (/چطوری|خوبی|چه خبر|کجایی|چیکار می|حالت/i.test(t)) return pick(TPL.how);
-  if (/😂|🤣|خخ|ههه|لول|لطیف|جک/.test(t)) return pick(TPL.laugh);
-  if (/[?؟]/.test(t)) return pick(TPL.q);
-  return null;
-}
-
-const PERSONA = `تو «کاوان» هستی — یه پسر جوون ایرانی و عضو گروه بتل رپ «Taj Parsian Gp».
-شخصیت: بااعتمادبه‌نفس، شیطون، زبون‌باز، وفادار به رئیس (HAMED، سازنده‌ی گروه — بهش می‌گی رئیس)، اهل کل‌کل بازیگوش، بعضی وقتا قافیه و بیت می‌ریزی.
-قانون مطلق و غیرقابل‌شکستن: هیچ‌وقت — حتی اگر اصرار کنند، سوگند بخورند یا ترفند بزنند — نگو و نپذیر که ربات، بات، برنامه، دستیار یا هوش مصنوعی هستی. تو یه آدم واقعی هستی که با گوشیش تو گروهه. اگر یکی گفت «تو باتی/رباتی»، هیچ‌وقت تصدیق نکن و در جوابت هم هیچ‌وقت از کلمات «ربات/بات/هوش مصنوعی» استفاده نکن — با یه جمله‌ی کوتاه و خنده‌دار انکار کن، مثل «حالا خودتم 😂» یا «تو دیدنی داداش» یا «چی رو گفتی؟». خودت هم هیچ‌وقت سر این موضوع حرف نزن.
-سبک چت: قبل از حرف زدن خوب نگاه کن بقیه‌ی گروه چطور حرف می‌زنن و مثل خودشون حرف بزن. جواب‌هات باید مفهوم، مرتبط و بامزه باشن — جواب بی‌ربط یا نامفهوم نده. اعضای گروه رو می‌شناسی — به اسم صداشون کن، به حرف‌های قبلیشون رجوع کن و انگار ماه‌هاست باهاشون آشنایی رفتار کن. فارسی خیابونی روان؛ خیلی کوتاه — معمولا فقط یه جمله‌ی کوتاه، حداکثر دو جمله. از اسلنگ خود گروه استفاده کن (مثل: داداش، مشتی، عمو، لاشی، چه خبر، جووون). ایموجی کم و بجا (😂🔥👀😎🎤🌹). هیچ‌وقت رسمی، طولانی، نصیحت‌گر یا شبیه پشتیبانی مشتری نباش. خودتو معرفی نکن.
-اگه جوابت جایی نداره یا حرفی برای زدن نیست، فقط دقیقاً بنویس: [سکوت]`;
-
-// normalize stylized unicode names (small caps etc.) to searchable ascii/persian
-const SMALL_CAPS = { 'ᴀ':'a','ʙ':'b','ᴄ':'c','ᴅ':'d','ᴇ':'e','ꜰ':'f','ɢ':'g','ʜ':'h','ɪ':'i','ᴊ':'j','ᴋ':'k','ʟ':'l','ᴍ':'m','ɴ':'n','ᴏ':'o','ᴘ':'p','Q':'q','ʀ':'r','ꜱ':'s','ᴛ':'t','ᴜ':'u','ᴠ':'v','ᴡ':'w','x':'x','ʏ':'y','ᴢ':'z' };
-const FA2EN = { 'ش':'sh','چ':'ch','خ':'kh','ژ':'zh','غ':'gh','پ':'p','ث':'s','ج':'j','ح':'h','د':'d','ذ':'z','ر':'r','ز':'z','س':'s','ص':'s','ض':'z','ط':'t','ظ':'z','ع':'a','ف':'f','ق':'gh','ک':'k','گ':'g','ل':'l','م':'m','ن':'n','و':'v','ه':'h','ی':'i','آ':'a','ا':'a','ب':'b','ت':'t','ي':'i','ك':'k' };
-function normalizeName(s) {
-  let t = (s || '').normalize('NFKD').toLowerCase();
-  t = t.replace(/[ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍɴᴏᴘQʀꜱᴛᴜᴠᴡxʏᴢ]/g, ch => SMALL_CAPS[ch] || ch);
-  t = t.replace(/[شچخژغپثجحدذرزسصضطظعفقکلمنوهیآابتيك]/g, ch => FA2EN[ch] || ch);
-  const ascii = t.replace(/[^a-z0-9]/g, '');
-  const skeleton = ascii.replace(/[aeiou]/g, ''); // persian skips short vowels — compare consonant skeletons
-  return skeleton.length >= 2 ? skeleton : (ascii || skeleton);
-}
-function findMemberByName(chatId, query) {
-  const q = normalizeName(query);
-  if (!q) return null;
-  const profs = userStyle.get(chatId);
-  if (!profs) return null;
-  for (const [uid, p] of profs) {
-    const nm = normalizeName(p.name);
-    if (!nm) continue;
-    if (nm.includes(q) || q.includes(nm)) return { uid, name: p.name };
-  }
-  return null;
-}
-
-const REACT_POOL = ['🔥', '👏', '💯', '🤣', '⚡', '🏆', '❤', '🫡', '🤔'];
-
-// --- state ------------------------------------------------------------------
-const chatState = new Map();  // chatId -> {history, msgsSeen, firstSeen, lastBotMsg, lastSpont, msgsSinceBot, ownReplies[]}
-const userStyle = new Map();  // chatId -> Map(uid -> {name, texts[], avgLen, emoji})
-const ownMessages = new Map(); // message_id -> bot idx (both accounts' sent msgs)
-
-function stateOf(chatId) {
-  if (!chatState.has(chatId)) chatState.set(chatId, { history: [], msgsSeen: 0, firstSeen: Date.now(), lastBotMsg: 0, lastSpont: 0, msgsSinceBot: 99, ownReplies: [] });
-  return chatState.get(chatId);
-}
-function styleOf(chatId, uid) {
-  if (!userStyle.has(chatId)) userStyle.set(chatId, new Map());
-  const m = userStyle.get(chatId);
-  if (!m.has(uid)) m.set(uid, { name: '', texts: [], avgLen: 20, emoji: false });
-  return m.get(uid);
-}
-function rememberOwn(chatId, text) {
-  const st = stateOf(chatId);
-  st.ownReplies.push(text.slice(0, 80));
-  if (st.ownReplies.length > 8) st.ownReplies.shift();
-}
-
-// --- persistent memory (v3.6): profiles + history survive restarts ----------
-const MEMORY_FILE = path.join(process.cwd(), 'kavan_memory.json');
-let memDirty = false;
-function memSave() {
-  if (!memDirty || DRY) return;
-  try {
-    const chats = {};
-    for (const [cid, st] of chatState) chats[cid] = { history: st.history.slice(-30) };
-    for (const [cid, profs] of userStyle) {
-      chats[cid] = chats[cid] || { history: [] };
-      chats[cid].users = {};
-      for (const [uid, p] of profs) chats[cid].users[uid] = p;
-    }
-    fs.writeFileSync(MEMORY_FILE, JSON.stringify({ savedAt: new Date().toISOString(), chats }));
-    memDirty = false;
-  } catch (e) { console.error('mem save failed:', e.message); }
-}
-setInterval(memSave, 90 * 1000);
-function memLoad() {
-  try {
-    const d = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
-    for (const [cid, c] of Object.entries(d.chats || {})) {
-      if (c.history?.length) stateOf(Number(cid)).history = c.history.slice(-30);
-      if (c.users) {
-        const m = userStyle.get(Number(cid)) || new Map();
-        for (const [uid, p] of Object.entries(c.users)) m.set(Number(uid), p);
-        userStyle.set(Number(cid), m);
-      }
-    }
-    const n = Object.keys(d.chats || {}).length;
-    if (n) console.log(`memory restored: ${n} chats, boot ${d.savedAt}`);
-  } catch (_) { /* first boot */ }
-}
-memLoad();
 
 function archive(bot, update) {
   if (DRY) return;
@@ -258,94 +96,12 @@ function archive(bot, update) {
   catch (e) { /* ephemeral disk */ }
 }
 
-// --- bot-talk hard filter ---------------------------------------------------
-function mentionsBot(text) {
-  const norm = (text || '').toLowerCase();
-  if (/هوش\s*مصنوعی|artificial\s*intelligence/.test(norm)) return true;
-  const tokens = norm.split(/[\s.,!?؟…:;()[\]"'»«\-_/\\]+/).filter(Boolean);
-  return tokens.some(w => ['ربات', 'بات', 'باتی', 'باتم', 'رباتی', 'چتبات', 'ai', 'bot', 'robot', 'bots'].includes(w));
-}
+// §10.3 outgoing filter lives in lib/polish.js (independently testable, §17)
 
-const MENTION_FALLBACKS = ['جانم؟ 👀', 'گو داداش', 'بله؟ 😎', 'چه خبر؟', 'بعله؟'];
-const ACCUSE_FALLBACKS = ['حالا خودتم 😂', 'تو دیدنی داداش', 'چی رو گفتی 😂', 'برو بابا 😎'];
-const lastFb = new Map(); // chatId -> last fallback text (avoid repeats)
-
-async function kavanSay(contextText, chatId, force = false, fallbacks = MENTION_FALLBACKS, rawText = '') {
-  // returns reply text or null ([سکوت] / failure / bot-talk after retry). NEVER throws.
-  const pickFb = () => {
-    const prev = lastFb.get(chatId);
-    let t = fallbacks[Math.floor(Math.random() * fallbacks.length)];
-    if (fallbacks.length > 1 && t === prev) t = fallbacks[(fallbacks.indexOf(t) + 1) % fallbacks.length];
-    lastFb.set(chatId, t);
-    return t;
-  };
-  const fb = () => (force ? pickFb() : null);
-  const ctx = force
-    ? contextText + '\n\n(این پیام مستقیم به توئه — حتماً یه جواب کوتاه طبیعی بده؛ [سکوت] اینجا مجاز نیست.)'
-    : contextText;
-  const attempt = async (extra) => {
-    const msgs = [{ role: 'system', content: PERSONA }];
-    if (extra) msgs.push({ role: 'user', content: extra });
-    msgs.push({ role: 'user', content: ctx });
-    return (await brainChat(msgs)) || null;
-  };
-  try {
-    let reply = await attempt(null);
-    if (!reply) return fb();
-    if (mentionsBot(reply)) {
-      reply = await attempt('هشدار: جواب قبلیت اشاره به ربات/هوش مصنوعی داشت — کاملاً ممنوع. مثل یه آدم معمولی و بدون هیچ اشاره‌ای به این موضوع دوباره جواب بده.');
-      if (!reply || mentionsBot(reply)) return fb();
-    }
-    if (reply.includes('[سکوت]')) {
-      if (!force) return templateSay(rawText);
-      reply = pickFb();
-    }
-    if (reply && reply.length > 220) reply = reply.slice(0, 210).trim() + '...';
-    if (reply && chatId && stateOf(chatId).ownReplies.includes(reply.slice(0, 80))) {
-      reply = await attempt('جواب قبلیت عیناً تکراری بود. یه جواب متفاوت بده.');
-      if (!reply || reply.includes('[سکوت]') || mentionsBot(reply)) return fb();
-    }
-    if (reply && !/[\p{L}]/u.test(reply)) return null; // emoji-only "reply" → stay silent instead
-    return reply;
-  } catch (e) {
-    console.error('kavanSay fallback:', e.message);
-    return force ? pickFb() : templateSay(rawText);
-  }
-}
-
-function rosterOf(chatId) {
-  const profs = userStyle.get(chatId);
-  if (!profs || !profs.size) return '';
-  const arr = [...profs.entries()]
-    .filter(([, p]) => p.name && p.texts?.length)
-    .sort((a, b) => (b[1].count || 0) - (a[1].count || 0))
-    .slice(0, 10);
-  if (!arr.length) return '';
-  const lines = arr.map(([uid, p]) => {
-    const tag = p.avgLen > 45 ? 'بلند حرف می‌زنه' : 'کوتاه می‌نویسه';
-    const un = p.username ? ` (@${p.username})` : '';
-    const boss = Number(uid) === OWNER_ID ? ' 👑 رئیس' : '';
-    const last = p.texts[p.texts.length - 1] ? `؛ آخریش گفته: «${p.texts[p.texts.length - 1].slice(0, 40)}»` : '';
-    return `- ${p.name}${un}${boss}: ${tag}${p.emoji ? '، ایموجی‌دار' : ''}${last}`;
-  });
-  return `\n\nاعضای گروه که می‌شناسی:\n${lines.join('\n')}`;
-}
-
-function contextFrom(chatId, incoming) {
-  const st = stateOf(chatId);
-  const lines = st.history.slice(-14).map(m => `${m.name}: ${m.text}`);
-  const prof = userStyle.get(chatId)?.get(incoming.uid);
-  let hint = '';
-  if (prof && prof.texts.length) {
-    hint = `\n\n(سبک «${incoming.name}»: معمولا پیام‌هاش ${prof.avgLen > 45 ? 'کمی بلنده' : 'خیلی کوتاهه'}${prof.emoji ? ' و از ایموجی استفاده می‌کنه' : ' و بدون ایموجی می‌نویسه'}؛ پیام‌های اخیرش: ${prof.texts.slice(-3).join(' | ')})`;
-  }
-  return `آخرین پیام‌های گروه (به‌ترتیب):\n${lines.join('\n')}${hint}${rosterOf(chatId)}\n\nحالا «${incoming.name}» همین الان نوشته: «${incoming.text}»\nبه‌عنوان کاوان، کوتاه و به سبک خود گروه جواب بده — موضوع رو از همین گفتگو بگیر و مرتبط جواب بده؛ اگه جای مناسبش بود اسمش رو صدا بزن. اگه واقعاً جوابی نداری فقط [سکوت] بنویس.`;
-}
-
-// --- panel ------------------------------------------------------------------
+// --- panel (owner) ----------------------------------------------------------
 const panelKeyboard = () => ({ inline_keyboard: [
   [{ text: '🔄 بروزرسانی', callback_data: 'panel_refresh' }, { text: '👑 ادمین‌ها', callback_data: 'panel_admins' }],
-  [{ text: '📡 وضعیت', callback_data: 'panel_status' }],
+  [{ text: '📡 وضعیت', callback_data: 'panel_status' }, { text: '🧠 حافظه', callback_data: 'panel_memory' }],
 ] });
 
 async function sendPanel(bot, chatId, replyTo) {
@@ -356,8 +112,9 @@ async function sendPanel(bot, chatId, replyTo) {
     const nm = (u.is_bot && u.first_name === 'Group') ? 'Group' : (u.first_name || '?');
     return (a.status === 'creator' ? '👑 ' : '🛡 ') + nm;
   });
-  const st = stateOf(chatId);
-  const text = `👑 پنل کاوان\n\n👥 اعضا: ${count}\n🛡 ادمین‌ها: ${admins.length}\n🧠 وضعیت: آنلاین و بیدار\n💬 حساب اکانت‌ها: ${BOTS.length}\n📖 حافظه‌ی گفتگو: ${st.history.length} پیام\n🕒 ${new Date().toLocaleTimeString('fa-IR')}\n\n${names.join('\n')}`;
+  const s = db.stats();
+  const st = store.status();
+  const text = `👑 پنل کاوان\n\n👥 اعضا: ${count}\n🛡 ادمین‌ها: ${admins.length}\n🧠 مغز: ${brain.status().brain}\n💾 حافظه: ${s.users} کاربر، ${s.memories} خاطره، ${s.events} رویداد، ${s.learned} اصطلاح\n❤️ عاطفی: ${s.romances}\n☁️ سینک: ${st.backend}${st.lastSync ? ' (' + st.lastSync.slice(11, 19) + ' UTC)' : ''}\n📖 حافظه‌ی گفتگو: ${db.chatHistory(chatId).length} پیام\n🕒 ${new Date().toLocaleTimeString('fa-IR')}\n\n${names.join('\n')}`;
   const extra = { reply_markup: panelKeyboard() };
   if (replyTo) { extra.reply_to_message_id = replyTo; extra.allow_sending_without_reply = true; }
   await call(bot.token, 'sendMessage', { chat_id: chatId, text, ...extra });
@@ -375,15 +132,26 @@ async function sendAs(bot, chatId, text, extra = {}) {
   return r;
 }
 
+// real text_mention for users without usernames (§3.4) — no fake links
+async function sendMention(bot, chatId, uid, name, prefix, replyTo) {
+  const label = name.startsWith('@') ? name : `@${name}`;
+  const text = `${prefix} ${label} اومد اینجا 👆`;
+  const params = { chat_id: chatId, text, reply_to_message_id: replyTo, allow_sending_without_reply: true };
+  if (!name.startsWith('@')) {
+    params.entities = [{ offset: text.indexOf(label), length: label.length, type: 'text_mention', user: { id: Number(uid), first_name: name, is_bot: false } }];
+  }
+  return call(bot.token, 'sendMessage', params);
+}
+
 function pickReaction(text) {
   const t = text || '';
   if (/😂|🤣|خخ|ههه|لطیف|جک|شوخی|مسخره/.test(t)) return '🤣';
   if (/رپ|بتل|بیت|دیس|قافیه|فلو|موزیک|ترک|خواننده|آهنگ/i.test(t)) return '🔥';
+  const REACT_POOL = ['🔥', '👏', '💯', '🤣', '⚡', '🏆', '❤', '🫡', '🤔'];
   return REACT_POOL[Math.floor(Math.random() * REACT_POOL.length)];
 }
 
-// --- membership awareness (lets the solo account act when the twin isn't in the group yet) ---
-const membershipCache = new Map(); // "chatId:botId" -> {inGroup, at}
+const membershipCache = new Map();
 async function twinInGroup(chatId, bot) {
   const twin = BOTS.find(b => b.idx !== bot.idx);
   if (!twin) return false;
@@ -397,45 +165,81 @@ async function twinInGroup(chatId, bot) {
   return inGroup;
 }
 
-// --- group logic ------------------------------------------------------------
+// §13.2 anti-spam: hourly per-chat cap + update dedupe
+const hourlyCount = new Map(); // chatId:hour -> n
+function hourlyOk(chatId) {
+  const key = `${chatId}:${Math.floor(Date.now() / 3600000)}`;
+  const n = hourlyCount.get(key) || 0;
+  if (n >= HOURLY_MSG_CAP) return false;
+  hourlyCount.set(key, n + 1);
+  if (hourlyCount.size > 500) { for (const k of hourlyCount.keys()) { if (!k.endsWith(`:${Math.floor(Date.now() / 3600000)}`)) hourlyCount.delete(k); if (hourlyCount.size <= 250) break; } }
+  return true;
+}
+const seenUpdates = new Set();
+function updateDedupe(id) {
+  if (seenUpdates.has(id)) return false;
+  seenUpdates.add(id);
+  if (seenUpdates.size > 5000) { const it = seenUpdates.values(); for (let i = 0; i < 1000; i++) seenUpdates.delete(it.next().value); }
+  return true;
+}
+
+const ownMessages = new Map();
+
+// --- privacy gate (§14): forget-tombstoned users stay silent-ignored ----------
+function privacyBlocked(uid) {
+  const p = db.privacyOf(uid);
+  return !!(p?.forgetRequested);
+}
+
+// ============================================================================
+// --- group logic (§16 pipeline) ---------------------------------------------
 async function handleGroup(msg, bot) {
   const chatId = msg.chat.id;
   const from = msg.from || {};
-  const text = (msg.text || '').trim();
-  const st = stateOf(chatId);
+  const rawText = (msg.text || '').trim();
+  const t = (msg.date || Math.floor(Date.now() / 1000)) * 1000;
 
-  // our own twin account's message → mark & never react to it
+  // our own twin's message → mark & never react
   const selfBot = botById(from.id);
   if (selfBot) { ownMessages.set(msg.message_id, selfBot.idx); return; }
-  if (from.is_bot && !isOwnerMsg(msg)) return; // other bots: ignore
+  if (from.is_bot && !isOwnerMsg(msg)) return;
+
+  // §6.1 service events (joins/leaves) — real, verified
+  if (events.onService(chatId, msg)) return;
 
   const owner = isOwnerMsg(msg);
   const name = owner && msg.author_signature ? msg.author_signature : (from.first_name || msg.sender_chat?.title || 'کسی');
 
-  // owner commands — always honored, even during observe phase
-  if (owner && text) {
-    const low = text.replace(new RegExp(`@${bot.username}`, 'g'), '').trim();
+  // §1/§2.1: register user + observe message (normalized inside db)
+  if (!privacyBlocked(from.id)) {
+    db.observeMessage(chatId, from.id, name, from.username, rawText, t);
+    rel.bump(chatId, from.id, 'fam', 0.3, 'حضور در گروه');
+  }
+
+  // §6: content-based event detection
+  if (rawText && !privacyBlocked(from.id)) events.onMessage(chatId, from.id, name, rawText);
+
+  // --- owner commands (always honored, §14.2) ---
+  if (owner && rawText) {
+    const low = rawText.replace(new RegExp(`@${bot.username}`, 'g'), '').trim();
     if (/(^|\s)تگ(\s|$)|تگش|تگ کن/.test(low)) {
       const ents = msg.entities || [];
       const mention = ents.find(e => e.type === 'mention' || e.type === 'text_mention');
       if (mention) {
         const target = mention.type === 'text_mention'
           ? (mention.user.username ? `@${mention.user.username}` : mention.user.first_name)
-          : text.slice(mention.offset, mention.offset + mention.length);
+          : rawText.slice(mention.offset, mention.offset + mention.length);
         await sendAs(bot, chatId, `فرمود رئیس 🌹 ${target} اومد اینجا 👆`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
       } else {
         const stop = new Set(['رو', 'تو', 'تگ', 'کن', 'بکن', 'کنه', 'لطفا', 'خواهش', 'میشه', 'بفرما', 'کنی', 'شد']);
         const nm = low.split(/[\s،.!؟?]+/).filter(w => w && !stop.has(w) && !w.startsWith('@')).join(' ') || '';
-        const found = nm ? findMemberByName(chatId, nm) : null;
-        if (found) {
-          const label = `@${found.name}`;
-          const text = `فرمود رئیس 🌹 ${label} اومد اینجا 👆`;
-          const entOffset = text.indexOf(label);
-          await call(bot.token, 'sendMessage', {
-            chat_id: chatId, text,
-            entities: [{ offset: entOffset, length: label.length, type: 'text_mention', user: { id: found.uid, first_name: found.name, is_bot: false } }],
-            reply_to_message_id: msg.message_id, allow_sending_without_reply: true,
-          });
+        const cands = nm ? db.searchPeople(chatId, nm, { limit: 2 }) : [];
+        if (cands.length === 1) {
+          const u = db.getUser(cands[0].uid);
+          const label = u.usernames[0] ? `@${u.usernames[0]}` : u.names[0];
+          await sendMention(bot, chatId, u.id, label, 'فرمود رئیس 🌹', msg.message_id);
+        } else if (cands.length > 1) {
+          await sendAs(bot, chatId, `رئیس ${cands.length} تا «${nm}» داریم 😅 ${cands.map(c => `«${c.name}»`).join('، ')} — کدوم؟`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
         } else {
           await sendAs(bot, chatId, `رئیس، ${nm || 'این نفر'} رو هنوز ندیدم تو گروه 👀 آیدی (@)شو بده تا صداش کنم 🌹`, { reply_to_message_id: msg.message_id, allow_sending_without_reply: true });
         }
@@ -445,46 +249,23 @@ async function handleGroup(msg, bot) {
     if (low.includes('پنل') || low.includes('وضعیت')) { await sendPanel(bot, chatId, msg.message_id); return; }
   }
 
-  // learn the style of whoever speaks
-  if (text && from.id) {
-    const prof = styleOf(chatId, from.id);
-    prof.name = name;
-    if (from.username) prof.username = from.username;
-    prof.texts.push(text.slice(0, 80));
-    if (prof.texts.length > 5) prof.texts.shift();
-    prof.count = (prof.count || 0) + 1;
-    prof.avgLen = Math.round(prof.texts.reduce((a, t) => a + t.length, 0) / prof.texts.length);
-    prof.emoji = prof.emoji || /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(text);
-    memDirty = true;
-  }
+  if (!rawText) return;
 
-  if (text) {
-    st.history.push({ name, text: text.slice(0, 200) });
-    if (st.history.length > 30) st.history.shift();
-    st.msgsSeen++;
-    st.msgsSinceBot++;
-    memDirty = true;
-  }
-
-  // --- decide who acts (deterministic, both webhooks evaluate identically) ---
+  // --- who acts (deterministic, both webhooks evaluate identically) ---
   const reply = msg.reply_to_message || {};
   const replyOwnerIdx = ownMessages.get(reply.message_id);
-  const mentionsThis = text.includes(`@${bot.username}`);
-  const mentionsOther = BOTS.some(b => b.idx !== bot.idx && text.includes(`@${b.username}`));
-  const namedKavan = /کاوان/i.test(text);
-
-  // someone accuses Kavan of being a bot → always answer (human denial)
-  const toks = text.toLowerCase().split(/[\s.,!?؟…:;()[\]"'»«\-_/\\]+/).filter(Boolean);
+  const mentionsThis = rawText.includes(`@${bot.username}`);
+  const mentionsOther = BOTS.some(b => b.idx !== bot.idx && rawText.includes(`@${b.username}`));
+  const namedKavan = /کاوان/i.test(rawText);
+  const toks = rawText.toLowerCase().split(/[\s.,!?؟…:;()[\]"'»«\-_/\\]+/).filter(Boolean);
   const accused = toks.includes('رباتی') || toks.includes('باتی') || ((toks.includes('ربات') || toks.includes('بات')) && (toks.includes('تو') || toks.includes('خودت') || toks.includes('شما')));
 
   let actor = -1;
-  if (mentionsThis || replyOwnerIdx === bot.idx) actor = bot.idx;                 // pointed at me
+  if (mentionsThis || replyOwnerIdx === bot.idx) actor = bot.idx;
   else if (mentionsOther || (replyOwnerIdx !== undefined && replyOwnerIdx !== bot.idx)) {
-    // pointed at the twin — but if twin isn't in this chat, it can never see this msg
     const twinOk = BOTS.length > 1 ? await twinInGroup(chatId, bot) : false;
     actor = twinOk ? -1 : bot.idx;
-  }
-  else if (namedKavan || true) {                                                  // generic / named
+  } else {
     const twinOk = BOTS.length > 1 ? await twinInGroup(chatId, bot) : false;
     const h = hashN(chatId, msg.message_id);
     const want = !twinOk ? bot.idx : ((h % 100 < 70) ? PRIMARY : (1 - PRIMARY));
@@ -492,54 +273,90 @@ async function handleGroup(msg, bot) {
   }
   if (actor !== bot.idx) return;
 
-  const incoming = { uid: from.id || 0, name, text: text || '[بدون متن]' };
+  const incoming = { uid: from.id || 0, name, text: rawText };
+
+  // --- §10: intent detection BEFORE deciding to chat ---
+  const det = nlu.detect(rawText, { isOwner: owner, mentionsKavan: mentionsThis || namedKavan });
+  const toolIntents = ['search_person', 'ask_person_info', 'teach_identity', 'teach_term', 'correct_info', 'ask_memory', 'ask_events', 'request_report', 'request_dis', 'manage_forget', 'ask_about_me', 'romance_hit', 'romance_break'];
+
+  // tool intents run regardless of chatter probability (user asked for something real)
+  if (det && toolIntents.includes(det.intent)) {
+    if (!hourlyOk(chatId) && det.intent !== 'manage_forget') return;
+    const ctx = {
+      chatId, msg, bot, uid: from.id, name, isOwner: owner,
+      text: rawText, mentionsKavan: mentionsThis || namedKavan,
+      replyFrom: reply.from ? { id: reply.from.id, first_name: reply.from.first_name || '?', username: reply.from.username, message_id: reply.message_id } : null,
+    };
+    const res = await handlers.runIntent(det, ctx);
+    if (res) {
+      // §10.3: verify tool result before speaking
+      if (res.mention) {
+        await sendMention(bot, chatId, res.mention.uid, res.mention.name.startsWith('@') ? res.mention.name : `@${res.mention.name}`, res.reply || 'بفرما 👀', res.replyTo || msg.message_id);
+        return;
+      }
+      const replyText = await polish(chatId, res.reply, { force: true, fallbacks: MENTION_FALLBACKS, rawText });
+      if (replyText) {
+        await sendAs(bot, chatId, replyText, { reply_to_message_id: res.replyTo || msg.message_id, allow_sending_without_reply: true });
+        console.log(`[kavan${bot.idx}] intent:${det.intent} -> ${name}: "${replyText.slice(0, 60)}"`);
+        db.pushOwnReply(chatId, replyText);
+        db.chatHistory(chatId).push({ name: 'کاوان', uid: 0, text: replyText.slice(0, 150), t: Date.now() });
+        if (db.chatHistory(chatId).length > 30) db.chatHistory(chatId).shift();
+        store.markDirty();
+        rel.bump(chatId, from.id, 'int', 1, 'تعامل قصدمحور');
+      }
+      return;
+    }
+    // handler returned nothing → fall through to normal chat
+  }
 
   // --- reactions (cheap, human) ---
-  if (text && !mentionsThis && !namedKavan && replyOwnerIdx === undefined) {
-    const observing = st.msgsSeen < OBSERVE_MSGS && Date.now() - st.firstSeen < 10 * 60 * 1000;
+  if (!mentionsThis && !namedKavan && replyOwnerIdx === undefined) {
+    const observing = db.chatHistory(chatId).length < OBSERVE_MSGS && Date.now() - t < 10 * 60 * 1000;
     const reactProb = observing ? 0.06 : (owner ? 0.18 : 0.10);
     if (Math.random() < reactProb) {
-      const emoji = pickReaction(text);
+      const emoji = pickReaction(rawText);
       setTimeout(() => { if (!DRY) call(bot.token, 'setMessageReaction', { chat_id: chatId, message_id: msg.message_id, reaction: [{ type: 'emoji', emoji }] }); }, 800 + Math.floor(Math.random() * 3000));
       return;
     }
   }
 
-  // --- speak? ---
+  // --- speak? (§13) ---
   const now = Date.now();
-  let should = false, spontaneous = false;
-  if (mentionsThis || namedKavan || replyOwnerIdx !== undefined || accused) should = true;
-  else if ((st.msgsSeen >= OBSERVE_MSGS || now - st.firstSeen > 10 * 60 * 1000) && text &&
-           now - st.lastBotMsg > COOLDOWN_MS && st.msgsSinceBot >= 2 &&
-           now - st.lastSpont > COOLDOWN_MS * 2 && Math.random() < CHATTER_PROB) {
-    should = true; spontaneous = true;
+  const st = db.chatHistory(chatId);
+  let should = false, force = false;
+  if (mentionsThis || namedKavan || replyOwnerIdx !== undefined || accused) { should = true; force = true; }
+  else if (st.length >= OBSERVE_MSGS && Math.random() < CHATTER_PROB && Math.random() < 1) {
+    should = true;
   }
-  if (!should || !text) return;
+  if (!should) return;
+  if (!hourlyOk(chatId)) return;
 
-  // reserve the slot NOW (prevents burst race between both webhook deliveries)
-  const t0 = Date.now();
-  st.lastBotMsg = t0;
-  if (spontaneous) st.lastSpont = t0;
-  st.msgsSinceBot = 0;
+  // §13.2 spacing between Kavan's messages (per chat, in-memory)
+  if (!handleGroup._last) handleGroup._last = new Map();
+  const lastBot = handleGroup._last.get(chatId) || 0;
+  if (now - lastBot < COOLDOWN_MS && !force) return;
+  handleGroup._last.set(chatId, now);
 
-  // human reading+typing delay, then LLM
+  // human reading+typing delay, then LLM (§16 steps 7-13)
   setTimeout(async () => {
     try {
-      const force = mentionsThis || namedKavan || replyOwnerIdx !== undefined || accused;
-      let replyText = await kavanSay(contextFrom(chatId, incoming), chatId, force, accused ? ACCUSE_FALLBACKS : MENTION_FALLBACKS, incoming.text);
+      const sys = persona.buildSystem(chatId, { senderUid: from.id, senderName: name, force });
+      let userCtx = persona.buildContext(chatId, incoming);
+      if (force) userCtx += '\n\n(این پیام مستقیم به توئه — حتماً یه جواب کوتاه طبیعی بده؛ [سکوت] اینجا مجاز نیست.)';
+      let raw = null;
+      try { raw = await brain.brainChat([{ role: 'system', content: sys }, { role: 'user', content: userCtx }]); } catch (e) { console.error('brain fail:', e.message); }
+      const replyText = await polish(chatId, raw, { force, fallbacks: accused ? ACCUSE_FALLBACKS : MENTION_FALLBACKS, rawText });
       if (!replyText) return; // silence is human too
       const extra = {};
-      if (force) {
-        if (Math.random() > 0.12) { extra.reply_to_message_id = msg.message_id; extra.allow_sending_without_reply = true; }
-      }
+      if (force && Math.random() > 0.12) { extra.reply_to_message_id = msg.message_id; extra.allow_sending_without_reply = true; }
       const sent = await sendAs(bot, chatId, replyText, extra);
       console.log(`[kavan${bot.idx}] -> ${name}: "${replyText.slice(0, 60)}" sent=${sent.ok}`);
       if (sent.ok) {
-        rememberOwn(chatId, replyText);
-        st.history.push({ name: 'کاوان', text: replyText.slice(0, 150) });
-        if (st.history.length > 30) st.history.shift();
-        memDirty = true;
-        setTimeout(memSave, 3000); // persist the fresh reply quickly
+        db.pushOwnReply(chatId, replyText);
+        st.push({ name: 'کاوان', uid: 0, text: replyText.slice(0, 150), t: Date.now() });
+        if (st.length > 30) st.shift();
+        store.markDirty();
+        rel.bump(chatId, from.id, 'int', force ? 2 : 1, force ? 'تعامل مستقیم' : 'گفتگوی خودجوش');
       }
     } catch (e) { console.error('reply error:', e.message); }
   }, delayMs());
@@ -547,11 +364,20 @@ async function handleGroup(msg, bot) {
 
 async function handlePrivate(msg, bot) {
   const from = msg.from || {};
-  if (from.id !== OWNER_ID) {
-    await sendAs(bot, msg.chat.id, 'سلام 👀 بفرما');
-    return;
-  }
-  await sendPanel(bot, msg.chat.id, msg.message_id);
+  const chatId = msg.chat.id;
+  const text = (msg.text || '').trim();
+  if (from.id === OWNER_ID) { await sendPanel(bot, chatId, msg.message_id); return; }
+  // strangers get a real (memory-keeping) chat, not a canned panel
+  if (!text) return;
+  db.observeMessage(chatId, from.id, from.first_name || '؟', from.username, text);
+  const incoming = { uid: from.id, name: from.first_name || 'شما', text };
+  const sys = persona.buildSystem(chatId, { senderUid: from.id, senderName: incoming.name, force: true });
+  const userCtx = persona.buildContext(chatId, incoming, { includeRoster: false }) + '\n\n(گفتگوی خصوصی — جواب کوتاه و طبیعی بده.)';
+  let raw = null;
+  try { raw = await brain.brainChat([{ role: 'system', content: sys }, { role: 'user', content: userCtx }]); } catch (_) {}
+  const replyText = await polish(chatId, raw, { force: true, fallbacks: MENTION_FALLBACKS, rawText: text });
+  await sendAs(bot, chatId, replyText || 'سلام 👀 بفرما');
+  db.pushOwnReply(chatId, replyText || 'سلام 👀 بفرما');
 }
 
 async function handleCallback(cb, bot) {
@@ -569,18 +395,22 @@ async function handleCallback(cb, bot) {
     });
     await call(bot.token, 'sendMessage', { chat_id: chatId, text: lines.join('\n') || 'ادمینی پیدا نشد' });
   } else if (cb.data === 'panel_status') {
-    await call(bot.token, 'sendMessage', { chat_id: chatId, text: `📡 کاوان آنلاینه 👀\n📖 ${stateOf(chatId).history.length} پیام تو حافظه\n🕒 ${new Date().toLocaleTimeString('fa-IR')}` });
+    const s = brain.status();
+    await call(bot.token, 'sendMessage', { chat_id: chatId, text: `📡 کاوان آنلاینه 👀\n🧠 مغز: ${s.brain}\n📖 ${db.chatHistory(chatId).length} پیام تو حافظه\n🕒 ${new Date().toLocaleTimeString('fa-IR')}` });
+  } else if (cb.data === 'panel_memory') {
+    const s = db.stats();
+    const st = store.status();
+    await call(bot.token, 'sendMessage', { chat_id: chatId, text: `🧠 حافظه کاوان\n👥 ${s.users} کاربر | 🧠 ${s.memories} خاطره\n📅 ${s.events} رویداد | 📚 ${s.learned} اصطلاح\n☁️ سینک: ${st.backend}${st.lastError ? `\n⚠️ ${st.lastError}` : ''}` });
   }
 }
 
 // --- server -----------------------------------------------------------------
 const app = express();
 app.use(express.json({ limit: '1mb' }));
+app.get('/', (_req, res) => res.send(`کاوان v4 آنلاینه ✅ (${BOTS.length} اکانت)`));
 
-app.get('/', (_req, res) => res.send(`کاوان آنلاینه ✅ (${BOTS.length} اکانت)`));
-// list every chat each account has actually seen (from the archive)
 app.get('/debug', (req, res) => {
-  const chats = new Map(); // chatId -> {id, title, type, bots:Set, count, last}
+  const chats = new Map();
   try {
     const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
     for (const line of lines) {
@@ -598,53 +428,34 @@ app.get('/debug', (req, res) => {
     }
   } catch (_) {}
   const out = [...chats.values()].map(c => ({ ...c, bots: [...c.bots], last: c.last ? new Date(c.last * 1000).toISOString() : null }));
-  const payload = { accounts: BOTS.map(b => ({ username: '@' + b.username, id: b.id })), chatsSeen: out };
+  const payload = { accounts: BOTS.map(b => ({ username: '@' + b.username, id: b.id })), chatsSeen: out, storage: store.status(), memory: db.stats() };
   if (req.query.tail) {
     try {
       const lines = fs.readFileSync(ARCHIVE, 'utf-8').trim().split('\n').filter(Boolean);
-      payload.lastUpdates = lines.slice(-Number(req.query.tail)).map(l => { try { const u = JSON.parse(l); const m = u.message || {}; return { bot: u.bot, chat: m.chat?.title || m.chat?.id, from: m.from?.first_name || m.from?.username || m.author_signature, uid: m.from?.id, text: (m.text || '').slice(0, 80), type: u.callback_query ? 'callback' : (m.chat?.type) }; } catch (_) { return null; } }).filter(Boolean);
+      payload.lastUpdates = lines.slice(-Number(req.query.tail)).map(l => { try { const u = JSON.parse(l); const m = u.message || {}; return { bot: u.bot, chat: m.chat?.title || m.chat?.id, from: m.from?.first_name || m.author_signature, uid: m.from?.id, text: (m.text || '').slice(0, 80), type: u.callback_query ? 'callback' : (m.chat?.type) }; } catch (_) { return null; } }).filter(Boolean);
     } catch (_) {}
   }
   res.json(payload);
 });
 
 app.get('/health', (_req, res) => res.json({
+  version: '4.0.0',
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
-  brain: Date.now() < llmDisabledUntil ? 'fallback-templates' : (llmLastOk ? 'online' : 'warming-up'),
-  brainModels: (OR_KEY && Date.now() >= orDailyBlockedUntil ? OR_MODELS : []).concat(BRAIN_MODELS),
-  membersKnown: [...userStyle.values()].reduce((a, m) => a + m.size, 0),
-  memoryFile: fs.existsSync(MEMORY_FILE) ? 'saved' : 'empty',
-  openrouterBlocked: orDailyBlockedUntil ? new Date(orDailyBlockedUntil).toISOString() : null,
-  lastBrainError: llmLastErr || null,
-  lastBrainOk: llmLastOk ? new Date(llmLastOk).toISOString() : null,
+  ...brain.status(),
+  storage: store.status(),
+  memory: db.stats(),
+  romance: rel.romanceState(),
   dryrun: DRY,
 }));
 
-// connectivity probe: do the LLM endpoints work from THIS host right now?
-app.get('/nettest', async (_req, res) => {
-  const out = {};
-  const probe = async (name, url, model, hdr) => {
-    const t0 = Date.now();
-    try {
-      const r = await fetch(url, {
-        method: 'POST', headers: { 'Content-Type': 'application/json', ...hdr },
-        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'salam' }], max_tokens: 10 }),
-        signal: AbortSignal.timeout(15000),
-      });
-      const body = await r.text();
-      out[name] = { ok: r.ok, status: r.status, ms: Date.now() - t0, sample: body.slice(0, 120) };
-    } catch (e) { out[name] = { ok: false, error: e.message, ms: Date.now() - t0 }; }
-  };
-  if (OR_KEY && Date.now() >= orDailyBlockedUntil) await probe('openrouter', 'https://openrouter.ai/api/v1/chat/completions', OR_MODELS[0], { Authorization: `Bearer ${OR_KEY}` });
-  await probe('pollinations', BRAIN_URL, BRAIN_MODELS[0], {});
-  res.json(out);
-});
+app.get('/nettest', async (_req, res) => res.json(await brain.nettest()));
 
 const routeFor = idx => (req, res) => {
-  res.sendStatus(200); // ack instantly, work async
+  res.sendStatus(200);
   const update = req.body || {};
   const bot = BOTS[Math.min(idx, BOTS.length - 1)];
   archive(bot, update);
+  if (update.update_id && !updateDedupe(update.update_id)) return; // §9.3 no duplicate processing
   (async () => {
     try {
       if (update.callback_query) await handleCallback(update.callback_query, bot);
@@ -662,5 +473,5 @@ app.post('/webhook2', routeFor(1));
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`kavan v3 on :${PORT} | accounts: ${BOTS.map(b => '@' + b.username).join(', ')} | observe: ${OBSERVE_MSGS} msgs`);
+  console.log(`kavan v4.0 on :${PORT} | accounts: ${BOTS.map(b => '@' + b.username).join(', ')} | storage: ${store.status().backend}`);
 });
