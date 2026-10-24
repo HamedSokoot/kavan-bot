@@ -439,7 +439,7 @@ app.get('/debug', (req, res) => {
 });
 
 app.get('/health', (_req, res) => res.json({
-  version: '4.0.0',
+  version: '4.0.2',
   bots: BOTS.map(b => ({ idx: b.idx, username: b.username, id: b.id })),
   ...brain.status(),
   storage: store.status(),
