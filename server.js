@@ -450,6 +450,14 @@ app.get('/health', (_req, res) => res.json({
 
 app.get('/nettest', async (_req, res) => res.json(await brain.nettest()));
 
+// diagnostic: probe any OpenRouter model from the server's region — /brainprobe?k=<BOT_TOKEN prefix 10>&model=...&q=optional prompt
+app.get('/brainprobe', async (req, res) => {
+  if (req.query.k !== (process.env.BOT_TOKEN || '').slice(0, 10)) return res.status(403).json({ error: 'forbidden' });
+  const model = String(req.query.model || '').trim();
+  if (!model) return res.status(400).json({ error: 'model query param required' });
+  res.json(await brain.brainProbe(model, req.query.q ? String(req.query.q).slice(0, 300) : undefined));
+});
+
 const routeFor = idx => (req, res) => {
   res.sendStatus(200);
   const update = req.body || {};
